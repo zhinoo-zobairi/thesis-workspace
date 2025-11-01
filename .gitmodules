@@ -1,0 +1,3 @@
+[submodule "external/papers"]
+	path = external/papers
+	url = https://github.com/zhinoo-zobairi/thesis-papers.git
