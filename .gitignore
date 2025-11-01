@@ -1,0 +1,12 @@
+# Never commit PDFs here
+*.pdf
+
+# Ignore local papers folder if it ever exists
+/papers/
+
+# Ignore PDFs inside any papers folder inside submodules
+external/papers/papers/*.pdf
+
+# Allow the submodule itself
+!external/
+!/external/papers/
