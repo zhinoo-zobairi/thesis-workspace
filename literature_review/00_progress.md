@@ -20,7 +20,7 @@
 ## Progress Log
 | Week | Papers | Focus | Key Takeaway |
 |------|---------|--------|--------------|
-| 1 | Schrötter et al. | Neural-Network vs Rule-based IDS | ? |
+| 1 | Schrötter et al. | Neural-Network vs Rule-based IDS | Neural IDSs show strong results in controlled datasets but they collapse in realistic conditions |
 | 2 | ? | ? | ? |
 
 ## Research Gaps
