@@ -1,5 +1,4 @@
 # Entwurf und Implementierung einer IPv6 Erweiterung für das Intrusion Detection System Snort 3.0
-
 - Snort 3 oder auch Snort++ genannt, ist eine inkrementelle Weiterentwicklung von Snort 2 in C++
 - Snort 3 versucht die **Skalierungsprobleme** durch:
 **die Einführung von Multithread-Support**
@@ -8,25 +7,36 @@ zu lösen.
 > Die beiden Plugin-APIs machen Snort2 dynamisch genug um es an neue Angriffsvektoren und neue Protokolle anzugleichen. Damit lässt sich die grundlegende Architektur an neue Anforderungen anpassen, jedoch **skaliert** sie mit gößer werdenden Datenmengen **nicht**. Der beschriebene **Abarbeitungsprozess** ist **single-threaded**. Es existieren Arbeiten die **Netzwerktraffic aufsplitten** und **von mehreren Instanzen analysieren lassen**. Dies kann aber zu einer **verringerten Erkennungsrate** führen, **aufgrund von unpassender Aufspaltung des Netzwerktraffics**. Ein weiteres Problem stellt die **Abarbeitung von Preprocessors** dar. Preprocessoren werden nach Aufbau des Pakets abgearbeitet, dies kann zu nutzlosen Aufrufen führen.
 
 - Neben besserer Skalierung wird versucht, die **Erweiterbarkeit zu verbessern**, sowie **die Konfiguration zu normalisieren**. Da Snort 3 eine **inkrementelle Weiterentwicklung** ist, wurde eine große Menge von C-Code portiert, welcher wieder zu **neuen Unstimmigkeiten** führt.
+> Snort 2 was single-threaded(one CPU core processes all packets sequentially, no splitting of tasks across multiple cores), monolithic(the system behaves like one big block of tightly-connected components) and difficult to extend without performance penalties. When increasing traffic, one core becomes the bottleneck, CPU frequency does not grow. External hacks like “split traffic across multiple Snort instances” often reduce detection accuracy because traffic belonging to the same TCP session gets split across multiple engines.
+
+> Snort 3 restructures the engine into:
+> 
+>* **multithreaded architecture**
+>* **modular components (inspectors) instead of preprocessors**
+>* **separation of decoding, normalization, and detection**
+>* **observer pattern for event signaling**
+>* **LuaJIT scripting for configuration**
+>Snort 3 is faster + **Context-aware processing** = understands the state or session the packet belongs to, for example HTTP only makes sense after TCP is established and after an HTTP request line is seen. Snort 2 preprocessors were **context-blind**. Every TCP packet triggered the HTTP preprocessor, even if it wasn’t HTTP. That is wasted CPU.
+
 ### Architektur
 ![alt text](Snort3_Architecture.png)
-- DAQ (**Data-Acquisition-Library**) als **Abstraktionsebene** zu libpcap genutzt 
-- die **Decoder** besitzen die selbe Aufgabe wie in Snort 2, wurden jedoch in C++ umgeschrieben. 
-- Decoder wurden so normalisiert, dass sie leicht erweiterbar sind.
+- DAQ (**Data-Acquisition-Library**) als **Abstraktionsebene** zu libpcap genutzt (to abstract packet capture, Snort doesn’t care where packets come from, like Snort's network card adapter layer)
+- die **Decoder** besitzen die selbe Aufgabe wie in Snort 2, wurden jedoch in C++ umgeschrieben = parse packet layers (Ethernet → IP → TCP → HTTP), normalize fields, set flags
+- Decoder wurden so normalisiert, dass sie leicht erweiterbar sind => Modular
 - Die Streamprozessoren zum Zusammensetzen von Fragmenten und Segmenten wurden zu einer eigenständigen Komponente.
 - Die anderen Aufgaben der ehemaligen Preprocessors aus Snort 2 wurden auf mehrere Inspektoren aufgeteilt. 
 - Netzwerkinspektoren und Serviceinspektoren sind die Wichtigsten:
 > Sie ermöglichen es, im Gegensatz zu den sonst kontextlosen Vergleichen normaler Regeln, **Kontext aufzubauen**. Dies wird ermöglicht, durch das **Allokieren von eigenem Speicher** und **das Verwalten von diesem** während der **gesamten Laufzeit**.
-- Der größte Unterschied zwischen Inspektoren und Preprocessors ist, dass die **Inpektoren** sogenannte **Insprektorevents auslösen** können.
+- Der größte Unterschied zwischen Inspektoren und Preprocessors ist, dass die **Inpektoren** sogenannte **Insprektorevents auslösen** können (A specific inspector raises an event; Other components listening to that event activate)
 
 - Insprektorevents sind die **Lösung für das zweite erwähnte Performance-Problem** in Snort 2. Inspektoren können jetzt mittels des **Observerpattern** *andere Komponenten auslösen*. Somit können viele **Inspektoraufrufe gespart** werden:
-> da sie nicht mehr bei jedem TCP-Paket aufgerufen werden, sondern nur für die, für die sie geschrieben wurden.
+> da sie nicht mehr bei jedem TCP-Paket aufgerufen werden, sondern nur für die, für die sie geschrieben wurden (An HTTP inspector only runs when traffic is HTTP. In Snort 2, it would run on every TCP packet.)
 
 - App-Ids: Transparenz für Externe Entwickler + Inspektoren beliebig zu erweitern ohne ursprünglichen Code zu verändern
 - mithilfe der Events: Post-Detection-Erweiterungen erstellen
 - ähnlich wie Decoder wurden die Logger in C++ umgeschrieben und normalisiert
 - Snort ist multithread-fähig **ABER**
-> Momentan ist es nur möglich, einen Thread pro Paketquelle zu generieren.
+> Momentan ist es nur möglich, einen Thread pro Paketquelle zu generieren (1 NIC --> 1 Snort thread => external load balancing)
 - Dies bedeutet, es wird wie unter Snort 2 ein **externer Load-balancer** benötigt um **mehrere Threads pro Interface zu erzeugen**. 
 ![alt text](Snort3_LoadBalancer.png)
 #### Ein Regel in Snort 2
@@ -46,11 +56,12 @@ http_uri; content :"& pid ="; nocase ; http_uri; content :"& mac
 - Jede Einstellung in der Konfiguration kann jetzt durch Kommandoparameter überschrieben werden
 - die Struktur von Werten wurde standardisiert.
 - ein neues Feature namens Binder
-    - Mittels Binder kann genauer definiert werden, wann bestimmte Inspektoren aufgerufen werden
+    - Mittels Binder kann genauer definiert werden, wann bestimmte Inspektoren aufgerufen werden; *The new mechanism that decides: exactly when an inspector should run* OR *a smart invocation dispatcher*
     - Inspektoren werden sonst **wie in Snort 2** bei **TCP**, **UDP** oder **IP** aufgerufen
     - Nun: wenn das PDU einen bestimmten Zielport besitzt
 
 ### Plug-Ins
+#### *Snort 3 as a platform, not just an IDS*
 - Eines der Ziele von Snort 3: eine **Plugin-API** für fast jede Komponente in Snort -> die **Erweiterbarkeit** weiter zu erhöhen
     - Decoder - um Pakete zu dekodieren
     - Inspektoren - siehe 2.2.1
@@ -69,7 +80,7 @@ http_uri; content :"& pid ="; nocase ; http_uri; content :"& mac
 - In der IpsApi werden **Typ des Plugin** und **API-Optionen** definiert.
 - ```s_name``` der Name des Plugins
 - ```s_help``` die Hilfe, die mit der Snort-Kommandozeile
-- der Konstruktor und Destruktor des Moduls
+- der Konstruktor und Destruktor des Moduls : constructor → allocates resources, destructor → cleans up
 - der base lässt sich der Typ der Regel und der Typ des zu analysierenden Verkehrs angegeben
 - Callbacks lassen sich registrieren für Funktionen, die ausgeführt werden sollen, wenn ein neuer Thread oder Prozess erstellt wird oder terminiert wird. 
 
