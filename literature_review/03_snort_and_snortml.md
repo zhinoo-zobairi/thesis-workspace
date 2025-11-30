@@ -52,7 +52,8 @@ This thesis uses the **F1-score** to measure SnortML’s detection performance.
 
 ### Results
 
-
+The model on CICIDS2017 turned out to be better than SnortML. As the text in 2.4.2 Discussion suggests, SnortML has proved ineffective for reliable threat detection. **So what am I doing?**
+ 
 ### Limitations
 
 
