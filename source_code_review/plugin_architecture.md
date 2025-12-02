@@ -45,7 +45,7 @@ Same pattern, different protocols.
 ## HOW SNORT PLUGINS WORK
 
  ┌─────────────────────────────────────────────────────────────────────────┐
- │                           SNORT 'CORE'                                    │
+ │                           SNORT 'CORE'                                  │
  │                                                                         │
  │  At startup, looks for plugin arrays like sin_http[]                    │
  └─────────────────────────────────────────────────────────────────────────┘
@@ -92,8 +92,8 @@ Same pattern, different protocols.
  │ Component            │ What it does                                   │
  ├──────────────────────┼────────────────────────────────────────────────┤
  │ Module (HttpModule)  │ Reads config, validates values, stores settings│
- │ 
- │Inspector            │ Does the actual work (inspects packets)        │
+ │                      │                                                │                                 
+ │Inspector             │ Does the actual work (inspects packets)        │
  │ (HttpInspect)        │                                                │
  └──────────────────────┴────────────────────────────────────────────────┘
 
@@ -104,11 +104,11 @@ Same pattern, different protocols.
  ┌──────────────────────────────────────────────────────────────────────┐
  │ 1. Snort core reads snort.lua                                        │
  │ 2. Sees "http_inspect = { decompress_pdf = true, ... }"              │
- │ 3. Snort calls: HttpApi::http_mod_ctor()                            │
- │                 ↓                                                     │
+ │ 3. Snort calls: HttpApi::http_mod_ctor()                             │
+ │                 ↓                                                    │
  │ 4. Creates: HttpModule object                                        │
- │ 5. Snort hands config data to HttpModule                            │
- │ 6. HttpModule validates and stores settings                         │
+ │ 5. Snort hands config data to HttpModule                             │
+ │ 6. HttpModule validates and stores settings                          │
  └──────────────────────────────────────────────────────────────────────┘
 
  At this point:
@@ -119,13 +119,13 @@ Same pattern, different protocols.
  Phase 2: PACKET PROCESSING (runtime)
  ┌──────────────────────────────────────────────────────────────────────┐
  │ 7. First HTTP packet arrives                                         │
- │ 8. Snort calls: HttpApi::http_ctor(module)                          │
- │                                     ^^^^^^                            │
+ │ 8. Snort calls: HttpApi::http_ctor(module)                           │
+ │                                     ^^^^^^                           │
  │                                     Passes the HttpModule            │
- │                 ↓                                                     │
+ │                 ↓                                                    │
  │ 9. Creates: HttpInspect object                                       │
- │ 10. HttpInspect reads settings FROM the HttpModule                  │
- │ 11. HttpInspect processes the packet                                │
+ │ 10. HttpInspect reads settings FROM the HttpModule                   │
+ │ 11. HttpInspect processes the packet                                 │
  └──────────────────────────────────────────────────────────────────────┘
 
  Now:
@@ -293,19 +293,19 @@ const BaseApi* sin_http[] =                  // For built-in
 ┌──────────────────────────────────────────────────────────────┐
 │ CMake Build Time                                             │
 ├──────────────────────────────────────────────────────────────┤
-│ 1. Compile http_api.cc → object file (contains sin_http[])  │
-│ 2. Link object files into snort executable                  │
-│ 3. sin_http[] becomes global symbol in executable           │
+│ 1. Compile http_api.cc → object file (contains sin_http[])   │
+│ 2. Link object files into snort executable                   │
+│ 3. sin_http[] becomes global symbol in executable            │
 └──────────────────────────────────────────────────────────────┘
                            ↓
 ┌──────────────────────────────────────────────────────────────┐
 │ Snort Startup                                                │
 ├──────────────────────────────────────────────────────────────┤
 │ 1. main() starts                                             │
-│ 2. Call load_builtin_plugins()                              │
-│ 3. Code says: extern const BaseApi* sin_http[];             │
-│ 4. Linker resolves to actual sin_http[] from http_api.cc    │
-│ 5. Loop through array and register plugins                  │
+│ 2. Call load_builtin_plugins()                               │
+│ 3. Code says: extern const BaseApi* sin_http[];              │
+│ 4. Linker resolves to actual sin_http[] from http_api.cc     │
+│ 5. Loop through array and register plugins                   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -315,19 +315,19 @@ const BaseApi* sin_http[] =                  // For built-in
 │ CMake Build Time                                             │
 ├──────────────────────────────────────────────────────────────┤
 │ 1. Compile http_api.cc                                       │
-│ 2. Link into libhttp_inspect.so                             │
-│ 3. Export snort_plugins[] as public symbol                  │
+│ 2. Link into libhttp_inspect.so                              │
+│ 3. Export snort_plugins[] as public symbol                   │
 └──────────────────────────────────────────────────────────────┘
                            ↓
 ┌──────────────────────────────────────────────────────────────┐
 │ Snort Startup                                                │
 ├──────────────────────────────────────────────────────────────┤
 │ 1. Read snort.lua config                                     │
-│ 2. See: plugins = { { library = "libhttp_inspect.so" } }    │
-│ 3. Call dlopen("libhttp_inspect.so")                        │
-│ 4. Call dlsym(handle, "snort_plugins")                      │
-│ 5. Get pointer to snort_plugins[] array                     │
-│ 6. Loop through array and register plugins                  │
+│ 2. See: plugins = { { library = "libhttp_inspect.so" } }     │
+│ 3. Call dlopen("libhttp_inspect.so")                         │
+│ 4. Call dlsym(handle, "snort_plugins")                       │
+│ 5. Get pointer to snort_plugins[] array                      │
+│ 6. Loop through array and register plugins                   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
