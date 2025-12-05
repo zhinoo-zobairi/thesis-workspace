@@ -382,3 +382,32 @@ const BaseApi* sin_mqtt[] = {
     nullptr
 };
 ```
+
+┌──────────────────────────────────────────────────────────────────┐
+│                    SAME SOURCE FILE                              │
+│                    (http_api.cc)                                 │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  #ifdef BUILDING_SO                                              │
+│  SO_PUBLIC const BaseApi* snort_plugins[] = { ... };  ← DYNAMIC  │
+│  #else                                                           │
+│  const BaseApi* sin_http[] = { ... };                 ← STATIC   │
+│  #endif                                                          │
+│                                                                  │
+│  Contents are IDENTICAL, only name differs                       │
+└──────────────────────────────────────────────────────────────────┘
+                          │
+          ┌───────────────┴───────────────┐
+          │                               │
+          ▼                               ▼
+┌─────────────────────┐         ┌─────────────────────┐
+│   STATIC BUILD      │         │   DYNAMIC BUILD     │
+│                     │         │                     │
+│ sin_http[] is in    │         │ snort_plugins[] is  │
+│ Snort executable    │         │ in libhttp.so       │
+│                     │         │                     │
+│ Found via:          │         │ Found via:          │
+│ extern sin_http[];  │         │ dlsym("snort_      │
+│ load_plugins(       │         │   plugins");        │
+│   sin_http);        │         │ load_plugins(api);  │
+└─────────────────────┘         └─────────────────────┘
