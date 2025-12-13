@@ -47,16 +47,213 @@ HttpFlowData(snort::Flow* flow, const HttpParaList* params_);
 ~HttpFlowData() override; // Decrement concurrent sessions
 
 ```
+````
+                        CONNECTION STARTS
+═══════════════════════════════════════════════════════════════════════
+
+TCP SYN         →  Client sends SYN
+TCP SYN/ACK     →  Server responds
+TCP ACK         →  Connection established!
+                        │
+                        ▼
+                   Snort creates a Flow object
+                        │
+                        ▼
+        First HTTP data arrives (e.g., "GET /page"), no FlowData yet
+                            │
+                            ▼
+     ┌──────────────────────────────────────────────────────────────┐
+     │          HttpStreamSplitter::scan() is called                │
+     │                        │                                     │
+     │                        ▼                                     │
+     │          "Do we have HttpFlowData for this flow?"            │
+     │                        │                                     │
+     │              NO → CREATE IT!                                 │
+     │                        │                                     │
+     │                        ▼                                     │
+     │          HttpFlowData() constructor runs                     │
+     │          (attached to Flow object)                           │
+     │                        │                                     │
+     │                        ▼                                     │
+     │          StreamSplitter parses HTTP boundaries               │
+     │          (finds end of headers, content-length, etc.)        │
+     └──────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+     ┌──────────────────────────────────────────────────────────────┐
+     │       HttpStreamSplitter::reassemble() is called             │
+     │       (assembles complete HTTP section)                      │
+     └──────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+     ┌──────────────────────────────────────────────────────────────┐
+     │  HttpInspect::eval() is called, retrieves existing FlowData  │
+     │                   asserts if null                            │
+     │                        │                                     │
+     │                        ▼                                     │
+     │          http_get_flow_data(flow)                            │
+     │                        │                                     │
+     │          FlowData MUST exist! (assert if null)               │
+     │          (StreamSplitter already created it)                 │
+     │                        │                                     │
+     │                        ▼                                     │
+     │          Process the HTTP message section                    │
+     └──────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════
+                     CONNECTION IS ALIVE
+              (seconds, minutes, or hours later...)
+═══════════════════════════════════════════════════════════════════════
+
+Many HTTP transactions happen:
+  GET /page1 → 200 OK     (Transaction 1)
+  GET /page2 → 200 OK     (Transaction 2)
+  POST /form → 302        (Transaction 3)
+  
+HttpFlowData lives through ALL of these
+(Transactions are created/deleted, but FlowData persists)
+
+═══════════════════════════════════════════════════════════════════════
+                        CONNECTION ENDS
+═══════════════════════════════════════════════════════════════════════
+
+TCP FIN         →  "I'm done sending"
+TCP FIN/ACK     →  "OK, me too"
+   (or TCP RST  →  "Connection forcefully reset!")
+                        │
+                        ▼
+              Snort sees connection is closed
+                        │
+                        ▼
+              Flow object is being destroyed
+                        │
+                        ▼
+              Flow iterates its FlowDataStore
+              (may contain multiple FlowData from different inspectors)
+                        │
+                        ▼
+              delete flowData;  // for each attached FlowData
+                        │
+                        ▼
+              ~HttpFlowData() destructor runs
+                        │
+                        ├── Cleans up discard_list, all attached FlowData
+                        ├── Deletes remaining transactions
+                        └── Decrements session counter
+````
+
+### Why Flow Has Multiple FlowData Objects
+
+A single TCP connection (Flow) can be processed by **multiple inspectors**, each with its own FlowData. HTTP, however, only creates ONE FlowData! Those multiple FlowData types are from different inspectors, not all from HTTP:
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │              One Flow (TCP conn)        │
+                    │                                         │
+                    │  FlowDataStore (list of FlowData):      │
+                    │  ┌─────────────────────────────────────┐│
+                    │  │ HttpFlowData   (id=42)              ││
+                    │  │ FileFlowData   (id=17)              ││
+                    │  │ SSLFlowData    (id=23)  (if HTTPS)  ││
+                    │  │ StreamFlowData (id=5)               ││
+                    │  └─────────────────────────────────────┘│
+                    └─────────────────────────────────────────┘
+```
+## ??? What to do for the MQQT Inspector ???
+- MQTT runs over TCP (Port 1883, or 8883 for TLS).
+````
+┌─────────────────────────────────────────┐
+│            MQTT Protocol                │
+├─────────────────────────────────────────┤
+│            TCP (port 1883)              │
+├─────────────────────────────────────────┤
+│            IP                           │
+└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│              MQTT TCP Connection (Flow)                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   FlowDataStore:                                                │
+│   ┌─────────────────┬─────────────────┬───────────────────────┐ │
+│   │ FlowData        │ Created by      │ Who writes it?        │ │
+│   ├─────────────────┼─────────────────┼───────────────────────┤ │
+│   │ StreamFlowData  │ Stream TCP      │ Snort (automatic)     │ │
+│   │ MqttFlowData    │ MqttInspect     │ YOU! ← only this one  │ │
+│   └─────────────────┴─────────────────┴───────────────────────┘ │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+````
+
+- Each FlowData has a unique ID. When HttpInspect needs its FlowData:
+
+```cpp
+// Gets ONLY HttpFlowData from the list, using its unique ID
+http_get_flow_data(flow)  // → flow->get_flow_data(HttpFlowData::inspector_id)
+```
 - `inspector_id`: Unique ID for HTTP inspector's flow data, Snort uses this to find our data attached to a flow
+  - Each inspector class has a static unique ID (e.g., HttpFlowData::inspector_id = 42)
+  - Flow stores multiple FlowData in a FlowDataStore (one per active inspector)
+  - Inspectors retrieve their FlowData with: `flow->get_flow_data(HttpFlowData::inspector_id)`
 
 - "friend" grants another class access to private members
-     - WHY SO MANY FRIENDS?
-       - HttpFlowData is the central state storage
-       - Many classes need to read/write this state
-       - Instead of 100 getter/setter methods, we use friends
-       - Trade-off: Less encapsulation, but simpler code
-- `HTTPCutter` that decides where to cut the TCP Byte Stream
-- `garbage_collect() `operates on `this->discard_list`: a member variable of **HttpFlowData**. It doesn't need parameters because it already has access to the data through this. It removes transactions that were processed by inspector to free up memory.
+  - WHY SO MANY FRIENDS?
+    - HttpFlowData is the central state storage
+    - Many classes need to read/write this state
+    - Instead of 100 getter/setter methods, we use friends
+    - Trade-off: Less encapsulation, but simpler code
+
+- `HttpCutter` decides where to cut the TCP Byte Stream by:
+```c++
+class HttpCutter {
+    // State machine for finding header boundaries
+    // - Scan byte-by-byte for \r\n\r\n
+    // - Handle partial data across packets
+    // - Track if we're in headers vs body
+    
+    // Body length determination
+    // - Parse Content-Length header
+    // - Handle chunked encoding (multiple chunks!)
+    // - Handle connection close
+};
+```
+
+## ??? Do we need a cutter as well for MQTT ???
+
+````
+┌──────────────────────────────────────────────────────────────┐
+│                    MQTT Packet                               │
+├─────────────┬──────────────────┬─────────────────────────────┤
+│ Fixed Header│ Remaining Length │ Variable Header + Payload   │
+│  (1 byte)   │   (1-4 bytes)    │   (N bytes)                 │
+├─────────────┴──────────────────┴─────────────────────────────┤
+│                                                              │
+│  Byte 0:    [Packet Type (4 bits)][Flags (4 bits)]           │
+│  Byte 1-4:  Variable-length integer (tells us EXACTLY        │
+│             how many more bytes to read!)                    │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+
+MQTT:                              HTTP:
+┌─────────────┐                    ┌─────────────────────────────┐
+│ Type │ Len  │ Payload            │ GET /page HTTP/1.1\r\n      │
+└──────┴──────┘                    │ Host: example.com\r\n       │
+   ↑                               │ Content-Type: text/html\r\n │
+                                   │ Content-Length: 42\r\n      │
+   Byte 1-4 tells us               │ \r\n                        │
+   EXACTLY how much                │ <body here>                 │
+   more to read!                   └─────────────────────────────┘
+                                      ↑
+                                      We must:
+                                      1. Find \r\n\r\n (end of headers)
+                                      2. Parse headers to find Content-Length
+                                      3. THEN we know body size
+                                      
+                                      OR it's chunked... even worse!
+````
+
+- `garbage_collect()` operates on `this->discard_list`: a member variable of **HttpFlowData**
+  - It removes transactions that were processed by inspector to free up memory
+
 ````
 HttpFlowData object:
 ┌──────────────────────────────────────────────────────────-┐
@@ -67,10 +264,6 @@ HttpFlowData object:
 │                                                           │
 └──────────────────────────────────────────────────────────-┘
 ````
-
-
-## ??? Do we need a cutter as well for MQTT???
-
 - **HttpTransaction** is a C++ object that stores: The request line, the response status, headers for both directions, body data, infractions/errors found during parsing. It is only created when we have enough data to start processing a message => One HTTP transaction = one request + its matching response:
     - HttpFlowData = per-CONNECTION state (can have multiple transactions)
     - HttpTransaction = per-REQUEST/RESPONSE state
@@ -157,9 +350,50 @@ One TCP Connection (Flow):
 │  │ GET /page1  │ │ GET /page2  │ │ POST /form  │                    │
 │  │ → 200 OK    │ │ → 200 OK    │ │ → 302 Redir │                    │
 │  └─────────────┘ └─────────────┘ └─────────────┘                    │
-│                                                                     │
+│   Transactions come and go; FlowData persists until conn closes     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+````
+Timeline:
+─────────────────────────────────────────────────────────────────────
+
+1. TCP connection established
+   └── Flow created (no FlowData yet)
+
+2. First HTTP data arrives ("GET /page...")
+   └── StreamSplitter::scan() creates HttpFlowData
+       └── HttpFlowData attached to Flow
+
+3. StreamSplitter finds complete request line section
+   └── reassemble() called
+       └── eval() called
+           └── attach_my_transaction() called
+               └── section_type == SEC_REQUEST
+                   └── NEW HttpTransaction created! ← HERE!
+                       └── Transaction added to pipeline
+
+4. More sections arrive (headers, body, response...)
+   └── Each section attached to EXISTING transaction
+       └── attach_my_transaction() finds it in pipeline
+````
+**Infractions:** The Timing Problem
+
+**Problem:** StreamSplitter may find protocol violations BEFORE a Transaction exists.
+````
+┌─────────────────────────────────────────────────────────────────┐
+│  StreamSplitter::scan() is parsing...                           │
+│                                                                 │
+│  "GET /page\x00HTTP/1.1\r\n"                                    │
+│              ↑                                                  │
+│         NULL byte! That's a violation!                          │
+│                                                                 │
+│  But wait... Transaction doesn't exist yet!                     │
+│  (Transaction is created in eval(), we're still in scan())      │
+│                                                                 │
+│  Where do we store this infraction?                             │
+└─────────────────────────────────────────────────────────────────┘
+````
+
 - `attach_my_transaction()` Cases: The function handles **three main cases**:
 
     - **CASE 1 - New Request (SEC_REQUEST)**: Handles the old transaction[CLIENT] before creating a new one.
@@ -202,7 +436,7 @@ HTTP needs:        "GET /page HTTP/1.1\r\n"  +  "Host: example.com\r\n\r\n"
 ```
 - `scan()`: The heart of the splitter
     - Called by Stream for each TCP segment. Scans bytes looking for
-    - message section boundaries (e.g., \r\n for request line, \r\n\r\n for headers).
+message section boundaries (e.g., \r\n for request line, \r\n\r\n for headers).
 - `reassemble()`: Package scanned bytes into a section
     - Called after `scan()` returns **FLUSH**. Takes the accumulated bytes and creates a buffer for the inspector to process.
 - `finish()`: Handle connection close
@@ -210,10 +444,9 @@ HTTP needs:        "GET /page HTTP/1.1\r\n"  +  "Host: example.com\r\n\r\n"
     - Handles truncated messages - data that arrived but wasn't flushed.
 - `prep_partial_flush()`: Prepare for partial body inspection
     - Used for flow depth and partial inspection. When we've seen enough
-    - body data, we can flush what we have even without a complete section.
+body data, we can flush what we have even without a complete section.
 - `go_away()`: Cleanup
-    - Called when splitter is no longer needed. Empty because HttpStreamSplitter
-    - is owned by HttpInspect, not dynamically allocated per-flow.
+    - Called when splitter is no longer needed. Empty because HttpStreamSplitter is owned by HttpInspect, not dynamically allocated per-flow.
     
 ## ??? PDU vs. MTU ???
 ---
@@ -247,8 +480,7 @@ HttpMsgSection(buffer, size, session_data, source_id, ...)
     └─► Save snapshot for detection context
 ```
 ---
-`http_msg_body.h/.cc`: Body Section Processing
-
+`http_msg_body.h/.cc`: Body Section Processing: HTTP messages arrive as a stream of bytes. Snort breaks them into logical sections:
 - `HttpMsgBody` handles message body chunks.
 Bodies can be large, so they arrive in multiple chunks (multiple `HttpMsgBody` objects per transaction).
 
@@ -295,23 +527,23 @@ The HTTP Inspector uses a **publish-subscribe (pub/sub)** system to notify other
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         HttpBodyEvent                                    │
+│                         HttpBodyEvent                                   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  Data Members:                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ http_body_ptr        → Pointer to body data bytes               │   │
-│  │ http_body_length     → Number of bytes in this piece            │   │
-│  │ is_data_originates_from_client → true=request, false=response   │   │
-│  │ last_piece           → true if this is the final piece          │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ http_body_ptr        → Pointer to body data bytes               │    │
+│  │ http_body_length     → Number of bytes in this piece            │    │
+│  │ is_data_originates_from_client → true=request, false=response   │    │
+│  │ last_piece           → true if this is the final piece          │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 │  Methods:                                                               │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ get_body(length)     → Returns body pointer, sets length        │   │
-│  │ is_data_from_client()→ Returns direction                        │   │
-│  │ is_last_piece()      → Returns if this is final chunk           │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ get_body(length)     → Returns body pointer, sets length        │    │
+│  │ is_data_from_client()→ Returns direction                        │    │
+│  │ is_last_piece()      → Returns if this is final chunk           │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -364,7 +596,7 @@ The HTTP Inspector uses a **publish-subscribe (pub/sub)** system to notify other
 - HTTP/2 stream identification
 - Offset tracking for reassembly
 
-**Key feature:** Uses **static depth limit** (`BODY_PUBLISH_DEPTH`) - fixed maximum regardless of subscriber requests.
+**Key feature:** Uses **static depth limit** (`BODY_PUBLISH_DEPTH`): fixed maximum regardless of subscriber requests.
 
 ### Chunked Body Publishing
 
@@ -402,13 +634,47 @@ Body data:       ├────────────────────
                  │  last_piece = false       │  (or last event has       │
                  │                           │   last_piece = true)      │
 ```
-
 **Why depth limits?**
 - Bodies can be gigabytes (video files, downloads)
-- Most inspection needs only first N bytes
-- Prevents memory exhaustion
-- `BODY_PUBLISH_DEPTH` is typically a few KB
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 HTTP Response (downloading a movie)             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  HTTP/1.1 200 OK                                                │
+│  Content-Type: video/mp4                                        │
+│  Content-Length: 4,500,000,000   ← 4.5 GB movie file!           │
+│                                                                 │
+│  [4.5 GB of video data...]                                      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 
+Without depth limits:
+  - Snort would try to buffer 4.5 GB
+  - Memory exhaustion → crash
+  - Even if it worked, scanning 4.5 GB is slow
+  - 99% of attacks are in the **FIRST** few KB anyway. So, most inspection needs only first N bytes.
+```
+**The Solution**: *Depth Limits*
+- `BODY_PUBLISH_DEPTH` is typically a few KB. `HttpRequestBodyEvent` always publishes up to this fixed amount. You can't change it at runtime via configuration.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  HTTP Body (4.5 GB total)                                       │
+│                                                                 │
+│  ├──────────────────┼──────────────────────────────────────────▶│
+│  │   First 16 KB    │         Rest of body (ignored)            │
+│  │  ← INSPECTED →   │                                           │
+│  │                  │                                           │
+│  └──────────────────┴──────────────────────────────────────────▶│
+│        ↑                                                        │
+│        │                                                        │
+│   request_depth = 16384  (configured in snort.lua)              │
+│   response_depth = 16384                                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 ---
 
 # NDP Inspector
@@ -427,50 +693,50 @@ Detects **IPv6 NDP attacks** including:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         NDP Inspector Architecture                           │
+│                         NDP Inspector Architecture                          │
 └─────────────────────────────────────────────────────────────────────────────┘
 
                               IPv6 Packets
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Indp::eval()                                    │
-│                         (Main Entry Point)                                   │
+│                              Indp::eval()                                   │
+│                         (Main Entry Point)                                  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                   │                                         │
 │              ┌────────────────────┴────────────────────┐                    │
 │              │                                         │                    │
 │              ▼                                         ▼                    │
-│     ┌─────────────────┐                     ┌─────────────────┐            │
-│     │   is_icmp()?    │                     │   parse_nonND() │            │
-│     │   ICMPv6 packet │                     │   Regular IPv6  │            │
-│     └────────┬────────┘                     │   (topology)    │            │
-│              │                              └─────────────────┘            │
+│     ┌─────────────────┐                     ┌─────────────────┐             │
+│     │   is_icmp()?    │                     │   parse_nonND() │             │
+│     │   ICMPv6 packet │                     │   Regular IPv6  │             │
+│     └────────┬────────┘                     │   (topology)    │             │
+│              │                              └─────────────────┘             │
 │              ▼                                                              │
-│     ┌─────────────────┐                                                    │
-│     │  parse_icmp6()  │                                                    │
-│     │  (ICMPv6 Router)│                                                    │
-│     └────────┬────────┘                                                    │
+│     ┌─────────────────┐                                                     │
+│     │  parse_icmp6()  │                                                     │
+│     │  (ICMPv6 Router)│                                                     │
+│     └────────┬────────┘                                                     │
 │              │                                                              │
-│    ┌─────────┼─────────┬─────────────┬─────────────┐                       │
-│    │         │         │             │             │                       │
-│    ▼         ▼         ▼             ▼             ▼                       │
-│ ┌──────┐ ┌──────┐ ┌──────┐    ┌──────────┐ ┌────────────┐                 │
-│ │RA    │ │NS    │ │NA    │    │ Redirect │ │ MLD        │                 │
-│ │type  │ │type  │ │type  │    │ type 137 │ │ type 130,  │                 │
-│ │134   │ │135   │ │136   │    │          │ │ 143, 151   │                 │
-│ └──┬───┘ └──┬───┘ └──┬───┘    └────┬─────┘ └─────┬──────┘                 │
-│    │        │        │             │             │                        │
-│    ▼        ▼        ▼             ▼             ▼                        │
-│ parse_ra parse_ns parse_na  parse_redirect  MLD checks                    │
-│                                                                            │
+│    ┌─────────┼─────────┬─────────────┬─────────────┐                        │
+│    │         │         │             │             │                        │
+│    ▼         ▼         ▼             ▼             ▼                        │
+│ ┌──────┐ ┌──────┐ ┌──────┐    ┌──────────┐ ┌────────────┐                   │
+│ │RA    │ │NS    │ │NA    │    │ Redirect │ │ MLD        │                   │
+│ │type  │ │type  │ │type  │    │ type 137 │ │ type 130,  │                   │
+│ │134   │ │135   │ │136   │    │          │ │ 143, 151   │                   │
+│ └──┬───┘ └──┬───┘ └──┬───┘    └────┬─────┘ └─────┬──────┘                   │
+│    │        │        │             │             │                          │
+│    ▼        ▼        ▼             ▼             ▼                          │
+│ parse_ra parse_ns parse_na  parse_redirect  MLD checks                      │
+│                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           State Caches                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
+┌────────────────────────────────────────────────────────────────────────────┐
+│                           State Caches                                     │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐             │
 │  │  RouterCache    │  │   HostCache     │  │  TmpHostCache   │             │
 │  │  (routers)      │  │   (hosts)       │  │  (tmphosts)     │             │
@@ -483,47 +749,57 @@ Detects **IPv6 NDP attacks** including:
 │  │ • flags         │  │ • last_ns/na    │  │ • last_ns/na    │             │
 │  │ • prefix_flags  │  │ • advert_count  │  │ • check[3]      │             │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘             │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Detection Events                                      │
+│                        Detection Events                                     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  DetectionEngine::queue_event(INDP_GID, SID)                               │
+│  DetectionEngine::queue_event(INDP_GID, SID)                                │
 │                                                                             │
 │  Alerts:                                                                    │
-│  • SID 1:  Spoofed Redirect           • SID 10: DAD Conflict               │
-│  • SID 2:  ND Flood                   • SID 11: Spoofed DAD                │
-│  • SID 3:  Router Kill (lifetime<5)   • SID 12: Unsolicited Advertise      │
-│  • SID 4:  RA from non-Router         • SID 13: MLD Flood                  │
-│  • SID 5:  New Router                 • SID 15: Neighbor Cache Poison      │
-│  • SID 6:  Router Flag Changed        • SID 16: MLD Query from non-Router  │
-│  • SID 7:  Router Prefix Changed      • SID 17: MLD RA from non-Router     │
+│  • SID 1:  Spoofed Redirect           • SID 10: DAD Conflict                │
+│  • SID 2:  ND Flood                   • SID 11: Spoofed DAD                 │
+│  • SID 3:  Router Kill (lifetime<5)   • SID 12: Unsolicited Advertise       │
+│  • SID 4:  RA from non-Router         • SID 13: MLD Flood                   │
+│  • SID 5:  New Router                 • SID 15: Neighbor Cache Poison       │
+│  • SID 6:  Router Flag Changed        • SID 16: MLD Query from non-Router   │
+│  • SID 7:  Router Prefix Changed      • SID 17: MLD RA from non-Router      │
 │  • SID 8:  New DAD                                                          │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Component Overview
+## Component Overview – it was a signature-based, no ML ???
 
 ### 1. Plugin Structure
+Every Snort3 inspector has 3 main components:
+```
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│    Module    │ ──── │  Inspector   │ ──── │  Plugin API  │
+│  (Config)    │      │  (Runtime)   │      │  (Glue)      │
+└──────────────┘      └──────────────┘      └──────────────┘
+     "WHAT"              "DO IT"            "HOW SNORT
+   settings &           actual work         FINDS US"
+   definitions
+```
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Snort3 Plugin Components                             │
+│                         Snort3 Plugin Components                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐   │
-│  │   IndpModule    │ ───── │      Indp       │ ───── │   InspectApi    │   │
-│  │   (Module)      │       │   (Inspector)   │       │   (Plugin API)  │   │
-│  ├─────────────────┤       ├─────────────────┤       ├─────────────────┤   │
-│  │ • Parameters    │       │ • eval()        │       │ • IT_NETWORK    │   │
-│  │ • Rules (SIDs)  │       │ • show()        │       │ • PROTO_BIT__IP │   │
-│  │ • Peg counts    │       │ • Parsers       │       │ • Constructor   │   │
-│  │ • set()/end()   │       │ • Caches        │       │ • Destructor    │   │
-│  └─────────────────┘       └─────────────────┘       └─────────────────┘   │
+│  ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐    │
+│  │   IndpModule    │ ───── │      Indp       │ ───── │   InspectApi    │    │
+│  │   (Module)      │       │   (Inspector)   │       │   (Plugin API)  │    │
+│  ├─────────────────┤       ├─────────────────┤       ├─────────────────┤    │
+│  │ • Parameters    │       │ • eval()        │       │ • IT_NETWORK    │    │
+│  │ • Rules (SIDs)  │       │ • show()        │       │ • PROTO_BIT__IP │    │
+│  │ • Peg counts    │       │ • Parsers       │       │ • Constructor   │    │
+│  │ • set()/end()   │       │ • Caches        │       │ • Destructor    │    │
+│  └─────────────────┘       └─────────────────┘       └─────────────────┘    │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -565,42 +841,42 @@ Snort Config (Lua)
 ### 3. Packet Processing Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         eval() Processing Flow                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Packet arrives                                                             │
-│       │                                                                     │
-│       ▼                                                                     │
+┌────────────────────────────────────────────────────────────────────────────┐
+│                         eval() Processing Flow                             │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  Packet arrives                                                            │
+│       │                                                                    │
+│       ▼                                                                    │
 │  ┌─────────────┐     No                                                    │
 │  │ is_ip6()?   │────────────► return (ignore)                              │
 │  └──────┬──────┘                                                           │
-│         │ Yes                                                               │
-│         ▼                                                                   │
-│  ┌─────────────┐     No      ┌─────────────────┐                           │
-│  │ is_icmp()?  │────────────►│  parse_nonND()  │                           │
-│  └──────┬──────┘             │  Build topology │                           │
-│         │ Yes                │  from traffic   │                           │
-│         ▼                    └─────────────────┘                           │
+│         │ Yes                                                              │
+│         ▼                                                                  │
+│  ┌─────────────┐     No      ┌────────────────────────────────────────────┐│
+│  │ is_icmp()?  │────────────►│ parse_nonND()                              ││
+│  └──────┬──────┘             │ Build topology from traffic                ││
+│         │ Yes                │ Map of "who is who" on the network.        ││
+│         ▼                    └────────────────────────────────────────────┘│
 │  ┌─────────────────┐                                                       │
 │  │  parse_icmp6()  │                                                       │
 │  └────────┬────────┘                                                       │
-│           │                                                                 │
-│           ▼                                                                 │
+│           │                                                                │
+│           ▼                                                                │
 │  ┌─────────────────┐                                                       │
 │  │ Check type:     │                                                       │
 │  │ 133-137 = NDP   │                                                       │
 │  │ 130,143,151=MLD │                                                       │
 │  └────────┬────────┘                                                       │
-│           │                                                                 │
+│           │                                                                │
 │     ┌─────┴─────┬─────────┬─────────┬─────────┐                            │
 │     ▼           ▼         ▼         ▼         ▼                            │
 │  type=134    type=135  type=136  type=137   MLD                            │
 │  parse_ra    parse_ns  parse_na  parse_     checks                         │
 │  (Router     (Neighbor (Neighbor redirect                                  │
 │   Advert)    Solicit)  Advert)                                             │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 
