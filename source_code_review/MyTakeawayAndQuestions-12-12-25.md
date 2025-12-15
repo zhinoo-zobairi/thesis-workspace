@@ -884,6 +884,9 @@ Snort Config (Lua)
 
 ### Router Advertisement Attacks (`parse_ra`)
 
+> **Router Advertisement (RA) Attacks**:  
+> An attacker sends fake or malicious Router Advertisement messages to disrupt IPv6 network routing. This can cause denial of service (by setting a very short router lifetime), introduce rogue routers (unauthorized devices that advertise themselves as routers to intercept or manipulate traffic), or change routing flags/prefixes to hijack or reroute traffic.
+
 ```
 RA Packet Arrives
        │
@@ -916,6 +919,9 @@ RA Packet Arrives
 
 ### Neighbor Cache Poisoning (`parse_na`)
 
+> **Neighbor Cache Poisoning**:  
+> The attacker sends spoofed Neighbor Advertisement (NA) messages to overwrite the mapping of an IPv6 address to a MAC address in the victim's cache. This can redirect traffic to the attacker (man-in-the-middle) or cause denial of service by breaking legitimate communication.
+
 ```
 NA Packet Arrives
        │
@@ -939,6 +945,9 @@ NA Packet Arrives
 ```
 
 ### DAD Attack Detection (`parse_ns`)
+
+> **DAD (Duplicate Address Detection) Attacks**:  
+> During IPv6 address assignment, hosts use Neighbor Solicitation (NS) to check if an address is already in use. An attacker can respond falsely, causing the victim to believe its address is taken (DoS), or can race to claim the address, leading to address conflicts or impersonation.
 
 ```
 NS Packet Arrives (with src = ::)
@@ -997,10 +1006,10 @@ alert ip6 any any -> any any (ip6_exthdr:!43; msg:"No routing header";)
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    IPS Option Plugin Architecture                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    IPS Option Plugin Architecture                          │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
 │  ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐     │
 │  │  ExthdrModule   │ ──── │ IpExthdrOption  │ ──── │    IpsApi       │     │
 │  │    (Module)     │      │  (IpsOption)    │      │  (Plugin API)   │     │
@@ -1010,8 +1019,8 @@ alert ip6 any any -> any any (ip6_exthdr:!43; msg:"No routing header";)
 │  │ • begin()       │      │ • operator==    │      │ • Destructor    │     │
 │  │ • Parsing       │      │ • config        │      │                 │     │
 │  └─────────────────┘      └─────────────────┘      └─────────────────┘     │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Key Components
