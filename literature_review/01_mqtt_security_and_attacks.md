@@ -58,12 +58,6 @@ broker.
 two parts: training (70% of traffic data, in terms of generated records) and test (the remaining 30%
 of traffic data).
 ![alt text](results.png)
-### Limitations
-
-
-### Relevance
-
-**Tags:** 
-
-### My Insight
+- It can be seen how the neural network correctly classifies legitimate traffic while the random forest identifies flood and malformed traffic and finally the naïve bayes algorithm classifies bruteforce attacks. 
+- All algorithms are able to identify the SlowITe attack very precisely.
 
