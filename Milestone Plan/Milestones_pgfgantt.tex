@@ -1,0 +1,176 @@
+% Vorlagen von der Leibniz Universit"at Hannover
+% http://kaldor.vwl.uni-hannover.de/karl/ltxmp/latex.php#DEcls
+
+% ergaenzt S. Christgau
+
+
+\documentclass[paper=a4,11pt,english]{scrartcl} % default ist 10pt (zu klein)
+\usepackage[a4paper,left=3cm,right=3cm,top=3cm,bottom=3cm]{geometry}
+\renewcommand\contentsname{Contents}
+  \usepackage[utf8]{inputenc} % dokument muss dann auch als UTF-8 (ohne BOM) gespeichert werden
+\usepackage[english ]{babel}
+\usepackage{booktabs}
+\usepackage{lipsum}
+% schrfitauswahl
+\usepackage[T1]{fontenc}
+\usepackage[sc]{mathpazo}  % alternativ \usepackage{charter}
+%\linespread{1.05}
+\usepackage[scaled]{beramono}
+\usepackage{float}
+\setkomafont{sectioning}{\normalcolor\bfseries} % Ändert Überschriftschriftart (nun mit Serifen)
+\usepackage{listings}
+\usepackage{graphicx}
+% als letztes package (fuer funktionierende Link im und ausserhalb des Dokuments)
+\usepackage[pdftex]{hyperref}
+\usepackage{pgfgantt}
+
+% ggf. falsche Worttrennung hier korrigieren
+\hyphenation{op-tical net-works semi-conduc-tor}
+\renewcommand\contentsname{Contents}
+\newcounter{myWeekNum}
+\stepcounter{myWeekNum}
+% Resetting weekcounter at the end of the year: https://tex.stackexchange.com/questions/402440/pgfgantt-how-to-customize-week-columns-in-a-gantt-chart-or-other-ideas
+% Also: only show every second week number to avoid crowded labels.
+\newcommand{\myWeek}{%
+    \ifodd\value{myWeekNum}\themyWeekNum\else\phantom{\themyWeekNum}\fi
+    \stepcounter{myWeekNum}%
+    \ifnum\value{myWeekNum}=53
+      \setcounter{myWeekNum}{1}%
+    \else\fi
+}
+\begin{document}
+%
+% paper title
+% can use linebreaks \\ within to get better formatting as desired
+\title{Milestone Plans with \texttt{pgfgantt}}
+
+\author{Zhinoo Zobairi}
+\date{January 2026}
+
+% make the title area
+\maketitle
+
+% Nicht bei einer Seminarausarbeitung. Da reicht die Zusammenfassung am Ende.
+%
+%\begin{abstract}
+%Eine kurze Zusammenfassung.
+%\end{abstract}
+\lstset{language=[latex]TeX,showspaces=false,showtabs=false,basicstyle=\scriptsize}          % Set your language (you can change the language for each code-block optionally)
+\section{Example Milestone Plan}
+\begin{figure}[h!tp]
+  \centering
+  \vspace{0.25cm}
+  \begin{ganttchart}[
+  %%%% Info: The Start date needs to be set further down, moving it up, messes up the format.
+  %%%% No free lines are allowed in the ganttchart,
+  %Overall Geometry
+  vgrid={*{6}{draw=none}, dotted},
+  hgrid={*{2}{draw=none}, dotted},
+  x unit=.055cm, % Geometry. With this and the font scaling, the size of the timeline can be adjusted, if too large, do landscape
+  y unit title=.75cm,
+  y unit chart=.55cm,
+  % Element Styles
+  bar label font = \fontsize{9.5}{9 }\selectfont,
+  bar label node/.append style={text width=4.8cm, align=right},
+  title label font=\fontsize{8}{8}\selectfont,
+  vrule label font=\fontsize{8}{8}\selectfont,
+  milestone label font=\fontsize{9.5}{9 }\selectfont\bfseries\itshape,
+  milestone label node/.append style={text width=4.8cm, align=right},
+  milestone/.append style={anchor=center,xshift=-1.4pt},
+  milestone/.append style={	color=purple,rounded corners=4pt,inner sep=2pt,draw=black}, % 0.6/1.4 ≈ 0.42857,
+  time slot format=isodate,
+  %%%% TIME INFO:
+  % Today
+  today={2026-01-01}, %Current Date
+  today label = Jan-01, % Current Date Label
+  today offset = 0.2,
+  today label font=\scshape\fontsize{9}{8}\selectfont,
+  % Color of the dashed rule for the today label
+  today rule/.style= {green!50!black, thick, dashed}, 
+  %Set Start and end of timeline, update week
+  % Set style of Date format (Month first/Day first)
+  time slot format/start date=2025-11-01]{2025-11-01}{2026-05-26} %Time Line Start and Finish
+  \setcounter{myWeekNum}{44}
+  \ganttset{calendar week text={\myWeek}}
+  \ganttset{bar height=.5}
+  % Decide what goes on top of the chart: years, months, weeks etc....and style it (needs to be done here)
+  \gantttitlecalendar{month=shortname, week} \\
+  \gantttitle[title label node/.append style={above left=12pt and -1pt}]{\textit{\fontsize{7}{7}\selectfont Week:}\quad}{0}
+  % Actual elements
+  \ganttbar[bar/.append style={fill=orange!90!black}]{Onboarding}{2025-11-01}{2025-11-30}\\
+  \ganttmilestone{Onboarding done (Nov 30)}{2025-11-30}\\
+  \ganttbar[bar/.append style={fill=orange!90!black}]{Snort Inspector}{2025-12-01}{2025-12-31}\\
+  \ganttmilestone{Snort Inspector done (Dec 31)}{2025-12-31}\\
+  \ganttbar[bar/.append style={fill=orange!90!black}]{Implementation (MQTT Inspector + Snort ML)}{2026-01-01}{2026-01-31}\\
+  \ganttmilestone{Implementation done (Jan 31)}{2026-01-31}\\
+  \ganttbar[bar/.append style={fill=orange!90!black}]{Evaluation}{2026-02-01}{2026-02-20}\\
+  \ganttmilestone{Evaluation done (Feb 20)}{2026-02-20}\\
+  \ganttbar[bar/.append style={fill=orange!90!black}]{Writing thesis text}{2026-02-28}{2026-05-26}\\
+  \ganttmilestone{Desired deadline (Mar 31)}{2026-03-31}\\
+  \ganttmilestone{Final deadline (May 26)}{2026-05-26} %\\
+  %End
+  \end{ganttchart}
+  % Add caption and remove trailing whitespeace 
+      \setlength\abovecaptionskip{-0.95\baselineskip}
+        \caption[Milestone plan made with pgfgantt]{Milestone plan made with \texttt{pgfgantt} (\url{https://ctan.org/pkg/pgfgantt?lang=de}).}
+  \end{figure}
+  \newpage
+  \section{Source Code for Milestone Plan}
+\begin{lstlisting}
+\begin{ganttchart}[
+%%%% Info: The Start date needs to be set further down, moving it up, messes up the format.
+%%%% No free lines are allowed in the ganttchart,
+%Overall Geometry
+% With this and the font scaling, the size of the timeline 
+% can be adjusted, if too large, do landscape
+vgrid={*{6}{draw=none}, dotted},
+hgrid={*{2}{draw=none}, dotted},
+x unit=.055cm,
+y unit title=.75cm,
+y unit chart=.55cm,
+% Element Styles
+bar label font = \fontsize{9.5}{9 }\selectfont,
+bar label node/.append style={text width=4.8cm, align=right},
+title label font=\fontsize{9.5}{9}\selectfont,
+vrule label font=\fontsize{9.5}{9}\selectfont,
+milestone label font=\fontsize{9.5}{9 }\selectfont\bfseries\itshape,
+milestone label node/.append style={text width=4.8cm, align=right},
+milestone/.append style={anchor=center,xshift=-1.4pt},
+milestone/.append style={color=purple,rounded corners=4pt,
+      inner sep=2pt,draw=black},
+time slot format=isodate,
+%%%% TIME INFO:
+% Today
+today={2026-01-01}, %Current Date
+today label = Jan-01, % Current Date Label
+today offset = 0.2,
+today label font=\scshape\fontsize{9}{8}\selectfont,
+% Color of the dashed rule for the today label
+today rule/.style= {green!50!black, thick, dashed}, 
+%Set Start and end of timeline, update week
+%Set style of Date format (Month first/Day first)
+time slot format/start date=2025-11-01]{2025-11-01}{2026-05-26} 
+\setcounter{myWeekNum}{44}
+\ganttset{calendar week text={\myWeek}}
+\ganttset{bar height=.5}
+% Decide what goes on top of the chart: years, months, 
+% weeks etc....and style it
+\gantttitlecalendar{month=shortname, week} \\
+% Add label "Week" before the week counter
+\gantttitle[title label node/.append style={
+      above left=12pt and -1pt}]{\textit{\fontsize{7}{7}
+      \selectfont Week:}\quad}{0}
+% Actual elements
+\ganttbar[bar/.append style={fill=orange!90!black}]{Onboarding}{2025-11-01}{2025-11-30}\\
+\ganttmilestone{Onboarding done (Nov 30)}{2025-11-30}\\
+\ganttbar[bar/.append style={fill=orange!90!black}]{Snort Inspector}{2025-12-01}{2025-12-31}\\
+\ganttmilestone{Snort Inspector done (Dec 31)}{2025-12-31}\\
+\ganttbar[bar/.append style={fill=orange!90!black}]{Implementation (MQTT Inspector + Snort ML)}{2026-01-01}{2026-01-31}\\
+\ganttmilestone{Implementation done (Jan 31)}{2026-01-31}\\
+\ganttbar[bar/.append style={fill=orange!90!black}]{Evaluation}{2026-02-01}{2026-02-20}\\
+\ganttmilestone{Evaluation done (Feb 20)}{2026-02-20}\\
+\ganttbar[bar/.append style={fill=orange!90!black}]{Writing thesis text}{2026-02-28}{2026-05-26}\\
+\ganttmilestone{Desired deadline (Mar 31)}{2026-03-31}\\
+\ganttmilestone{Final deadline (May 26)}{2026-05-26} %\\
+\end{ganttchart}  \end{lstlisting}
+\end{document}

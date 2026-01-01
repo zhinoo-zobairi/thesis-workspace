@@ -1,6 +1,14 @@
 # Never commit PDFs here
 *.pdf
 
+# LaTeX build artifacts (keep .tex sources)
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+
 # Ignore local papers folder if it ever exists
 /papers/
 
