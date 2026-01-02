@@ -577,3 +577,19 @@ And it stays readable and maintainable.
 ## What does it mean in C++ when we write a function and set it equal to = delete?
 ### It means: “This function exists conceptually, but I forbid anyone from calling it.”
 > If a constructor is deleted, every syntax that would call it is illegal.
+
+---
+## Include Guards, a Makefile rule
+- A **defensive pattern** in a header file ensures the **header’s contents are processed at most once** per translation unit (*per .cpp* after all #includes are expanded).
+---
+### Brief note
+
+In C++, **pass-by-value is the default** and behaves exactly like in C: the function receives a copy, and changes do not affect the caller. C++ extends this model by introducing **references (`T&`)**, which allow a function to operate on the caller’s object **without exposing pointer syntax** at the call site. As a result, both pass-by-value and pass-by-reference look identical to the caller (`f(x)`), and the actual passing semantics are defined solely by the function signature. This design shifts responsibility and intent into the callee, enabling cleaner APIs, safer aliasing, and stronger abstraction compared to C, where pointers are the only mechanism for indirect access.
+---
+What: Special function called when object is destroyed.
+When called: Connection closes, object deleted with delete, or goes out of scope.
+Purpose: Decrement concurrent session count, free resources.
+
+The tilde ~ is C++ syntax meaning "destructor" - always has tilde before class name.
+
+Why destructor? To clean up properly:
