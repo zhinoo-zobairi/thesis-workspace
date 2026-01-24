@@ -14,7 +14,7 @@ Those who don't have a direct source next to them, are from Ivan.
 - Unlike presented related works on the topic, in this paper we introduce MQTTset, a dataset including raw traffic data related to the MQTT protocol, widely adopted in IoT environments. 
 - MQTTset is released both as CSV and PCAP raw data.
 - The proposed dataset contains both legitimate and attack traffic, by considering all the data of the communications on the reference scenario (e.g., authentications, disconnection, etc.)
-- MQTTset was built by using IoT-Flock [42]
+- MQTTset was built by using IoT-Flock, which is a traffic generator that can **emulate IoT networks** using either **MQTT** or **CoAP** (a dual-protocol IoT traffic generator) [42]
 - IoT-Flock provides the ability to configure the network scenario, in terms of nodes (e.g., sensor type, IP addresses, listening ports, etc.) and communications
 (e.g., time interval used for communications between the sensors and the broker). 
 - In addition, the tool implements different cyber-threats against the MQTT and CoAP: publish flood, packet crafting attacks, segmentation fault attack against CoAP (making use of a null Uri-path), and memory leak attacks against CoAP (by using invalid CoAP options during packets forging).
@@ -60,4 +60,3 @@ of traffic data).
 ![alt text](results.png)
 - It can be seen how the neural network correctly classifies legitimate traffic while the random forest identifies flood and malformed traffic and finally the naïve bayes algorithm classifies bruteforce attacks. 
 - All algorithms are able to identify the SlowITe attack very precisely.
-

@@ -110,22 +110,24 @@ bool get_buf_mqtt_client_id(Packet* p, InspectionBuffer& b)
     if (!p->is_full_pdu() || p->dsize < 2)
         return false;
     
-    // 2. Check packet type (must be CONNECT = 1)
-    uint8_t packet_type = p->data[0] >> 4;
-    if (packet_type != 1)
+    // 2. Parse packet type (must be CONNECT = 1)
+    uint8_t packet_type = p->data[0] >> 4; // If we didn't shift right by 4, and the byte was 0001 0000, the value would be 16 instead of 1.
+    if (packet_type != 1) // And we had to write `if (packet_type != 16)` here
         return false;
     
-    // 3. Skip remaining length bytes (1-4 bytes with bit 7 = continuation flag)
+    // 3. Parse and skip remaining length bytes (1-4 bytes with bit 7 = continuation flag)
     int offset = 1;
     while (offset < 5 && offset < p->dsize) {
-        if ((p->data[offset++] & 0x80) == 0)
-            break;
+        if ((p->data[offset++] & 0x80) == 0){ // "Is bit 7 zero?": Here we mask the 7th bit as continuation flag with 1000 0000 (0x80)
+            break; // keeping only bit 7 and zeroing out bits 0-6, if result of the AND operation is 0, it means the continuation flag was 0 and it was the last byte
+        }
     }
     
     // 4. Skip Protocol Name (2-byte length + string "MQTT")
     if (offset + 2 > p->dsize)
         return false;
-    uint16_t proto_len = (p->data[offset] << 8) | p->data[offset + 1];
+    //  shift-and-OR pattern:
+    uint16_t proto_len = (p->data[offset] << 8) | p->data[offset + 1]; // For the number 4: MSB occupying the first memory place: holds the big place values but they're all zero, no contribution – LSB occupying the first memory place: holds the small place values and the 4 bit is set, this is where the actual value lives. So even though MSB is "most significant" in terms of position/weight, for small numbers like 4, all the actual value is in the LSB!
     offset += 2 + proto_len;
     
     // 5. Skip Version (1 byte) + Connect Flags (1 byte) + Keep Alive (2 bytes)
@@ -134,6 +136,7 @@ bool get_buf_mqtt_client_id(Packet* p, InspectionBuffer& b)
     // 6. Read Client ID Length
     if (offset + 2 > p->dsize)
         return false;
+    //  shift-and-OR pattern:
     uint16_t client_id_len = (p->data[offset] << 8) | p->data[offset + 1];
     offset += 2;
     
