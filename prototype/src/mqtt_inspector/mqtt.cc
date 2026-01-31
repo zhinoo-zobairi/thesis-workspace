@@ -542,67 +542,105 @@ void Mqtt::eval(Packet* p)
         gettimeofday(&pkt_time, nullptr);
     mfd->update_timing(pkt_time);
 
-    parse_fixed_header(p, &mfd->ssn_data);
+    parse_fixed_header(p, &mfd->ssn_data); // Runs for ALL packets
     
     uint8_t msg_type = mfd->ssn_data.msg_type;
 
-    switch (msg_type)
+    switch (msg_type) // Cases based on Table 2.1, 2.2.1 MQTT Control Packet type
     {
     case 1:  // CONNECT
-        parse_connect_packet(p, &mfd->ssn_data); // Step 1: Parse raw bytes into ssn_data
-    {
-        {
-            MqttConnectEvent event(mfd->ssn_data.client_id, mfd->ssn_data.client_id_len); // Step 2: Package ssn_data fields into an Event object
-            // Step 3: Publish the event (subscribers receive it); The Event is a "data package" sent via DataBus.
-            DataBus::publish(mqtt_pub_id, MqttEventIds::MQTT_CONNECT, event, p->flow); // Defined in: data_bus.h:117
-        }
+        parse_connect_packet(p, &mfd->ssn_data); // Extracts MORE fields
         break;
         
     case 2:  // CONNACK
-        parse_connack_packet(p, &mfd->ssn_data);
+        parse_connack_packet(p, &mfd->ssn_data); // Extracts MORE fields
         if (mfd->ssn_data.conack_return_code != 0) {
             mfd->record_auth_failure(pkt_time);
         }
         break;
         
     case 3:  // PUBLISH
-        parse_publish_packet(p, &mfd->ssn_data);
-        {
-            MqttPublishEvent event(mfd->ssn_data.topic, mfd->ssn_data.topic_len,
-                                   mfd->ssn_data.payload, mfd->ssn_data.payload_len,
-                                   mfd->ssn_data.qos);
-            DataBus::publish(mqtt_pub_id, MqttEventIds::MQTT_PUBLISH, event, p->flow);
-        }
+        parse_publish_packet(p, &mfd->ssn_data); // Extracts MORE fields
         break;
         
-    case 4:  // PUBACK
-    case 5:  // PUBREC
-    case 6:  // PUBREL
-    case 7:  // PUBCOMP
-    case 11: // UNSUBACK
-        parse_ack_packet(p, &mfd->ssn_data);
+    case 4:  // PUBACK – NO extra fields
+    case 5:  // PUBREC – NO extra fields
+    case 6:  // PUBREL – NO extra fields
+    case 7:  // PUBCOMP – NO extra fields
+    case 11: // UNSUBACK – NO extra fields
+        parse_ack_packet(p, &mfd->ssn_data); // Extracts MORE fields
         break;
         
     case 8:  // SUBSCRIBE
-        parse_subscribe_packet(p, &mfd->ssn_data);
+        parse_subscribe_packet(p, &mfd->ssn_data); // Extracts MORE fields
         break;
         
     case 9:  // SUBACK
-        parse_suback_packet(p, &mfd->ssn_data);
+        parse_suback_packet(p, &mfd->ssn_data); // Extracts MORE fields
         break;
         
     case 10: // UNSUBSCRIBE
-        parse_unsubscribe_packet(p, &mfd->ssn_data);
+        parse_unsubscribe_packet(p, &mfd->ssn_data); // Extracts MORE fields
         break;
         
-    case 12: // PINGREQ
-    case 13: // PINGRESP
-    case 14: // DISCONNECT
+    case 12: // PINGREQ – NO extra fields, 2 bytes total (fixed header only)
+    case 13: // PINGRESP – NO extra fields, 2 bytes total (fixed header only)
+    case 14: // DISCONNECT – NO extra fields, 2 bytes total (fixed header only)
         break;
         
     default:
         DetectionEngine::queue_event(GID_MQTT, MQTT_RESERVED_TYPE);
         break;
+    }
+    
+    // Publish comprehensive feature event for ML (every packet)
+    {
+        MqttFeatureEvent fe;
+        
+        // Fixed header
+        fe.msg_type = mfd->ssn_data.msg_type;
+        fe.dup_flag = mfd->ssn_data.dup_flag;
+        fe.qos = mfd->ssn_data.qos;
+        fe.retain = mfd->ssn_data.retain;
+        fe.remaining_len = mfd->ssn_data.remaining_len;
+        
+        // CONNECT fields
+        fe.protocol_version = mfd->ssn_data.protocol_version;
+        fe.connect_flags = mfd->ssn_data.connect_flags;
+        fe.conflag_clean_session = mfd->ssn_data.conflag_clean_session;
+        fe.conflag_will_flag = mfd->ssn_data.conflag_will_flag;
+        fe.conflag_will_qos = mfd->ssn_data.conflag_will_qos;
+        fe.conflag_will_retain = mfd->ssn_data.conflag_will_retain;
+        fe.conflag_passwd = mfd->ssn_data.conflag_passwd;
+        fe.conflag_uname = mfd->ssn_data.conflag_uname;
+        fe.keep_alive = mfd->ssn_data.keep_alive;
+        fe.client_id_len = mfd->ssn_data.client_id_len;
+        fe.username_len = mfd->ssn_data.username_len;
+        fe.passwd_len = mfd->ssn_data.passwd_len;
+        fe.will_topic_len = mfd->ssn_data.will_topic_len;
+        fe.will_msg_len = mfd->ssn_data.will_msg_len;
+        
+        // CONNACK fields
+        fe.conack_return_code = mfd->ssn_data.conack_return_code;
+        fe.conack_session_present = mfd->ssn_data.conack_session_present;
+        
+        // PUBLISH fields
+        fe.topic_len = mfd->ssn_data.topic_len;
+        fe.payload_len = mfd->ssn_data.payload_len;
+        fe.msg_id = mfd->ssn_data.msg_id;
+        
+        // Timing features
+        fe.time_delta_us = mfd->get_time_delta_us();
+        fe.time_relative_us = mfd->get_time_relative_us();
+        
+        // Brute force detection
+        fe.failed_auth_per_second = mfd->get_failed_auth_per_second(pkt_time);
+        fe.failed_auth_count = mfd->timing.failed_auth_count;
+        
+        // Flow statistics
+        fe.pkt_count = mfd->timing.pkt_count;
+        
+        DataBus::publish(mqtt_pub_id, MqttEventIds::MQTT_FEATURE, fe, p->flow); // fe destroyed here (destructor called, because scope or block ends – Without block, fe exists until end of function)
     }
 }
 
@@ -675,7 +713,7 @@ extern const BaseApi* ips_mqtt_topic;
 extern const BaseApi* ips_mqtt_payload;
 
 #ifdef BUILDING_SO
-SO_PUBLIC const BaseApi* snort_plugins[]
+SO_PUBLIC const BaseApi* snort_plugins[] =
 #else
 const BaseApi* sin_mqtt[] =
 #endif

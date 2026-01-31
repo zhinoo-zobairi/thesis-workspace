@@ -14,7 +14,7 @@ struct MqttStats
 };
 
 struct mqtt_session_data_t //naming inspired by modbus:Data extracted from the current PDU (CURRENT message being processed in this session), Reset for EACH new MQTT message, Named "session" because it's the current "work"
-{
+{ // every field starts at 0 for each new packet because MqttFlowData::reset() zeroes the entire struct.
     // Phase1, mqtt.hdrflags - Full first byte containing type + flags
     uint8_t hdr_flags;
     // Phase1, mqtt.msgtype - Packet type (1-14)
