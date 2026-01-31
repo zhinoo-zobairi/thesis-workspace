@@ -1,3 +1,49 @@
+**MQTT PDU** stands for **MQTT Protocol Data Unit**.
+
+It is **one complete, self-contained MQTT protocol message**.
+
+Examples of MQTT PDUs:
+
+* CONNECT
+* CONNACK
+* PUBLISH
+* SUBSCRIBE
+* SUBACK
+* PINGREQ
+* PINGRESP
+* DISCONNECT
+
+Each of these is **one PDU**.
+
+* **TCP packet**
+  Transport-level container, may carry partial data
+
+* **MQTT PDU**
+  Application-level unit, must be complete to be meaningful
+
+A single MQTT PDU:
+
+* Can be split across many TCP packets
+* Or multiple PDUs can be packed into one TCP packet
+
+TCP does not care. MQTT does.
+
+Tools like Snort use **generic terminology**.
+
+So:
+
+* The framework says “packet”
+* The inspector interprets it as “the PDU for my protocol”
+
+When Snort inspects MQTT:
+
+> `Packet*` actually holds **one complete MQTT PDU**
+
+Not a TCP packet.
+
+---
+
+```
 ┌─────────────────────────────────────────────────────────────┐
 │                      Snort Core                             │
 │                                                             │
@@ -28,7 +74,7 @@
 │   - get_splitter(...): return stream splitter               │
 │   - etc.                                                    │
 └─────────────────────────────────────────────────────────────┘
-
+```
 
 ## Every inspector follows this pattern
 

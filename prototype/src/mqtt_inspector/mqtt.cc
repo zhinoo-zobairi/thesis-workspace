@@ -4,6 +4,9 @@
 
 #include "mqtt.h"
 
+#include <cstring>
+#include <sys/time.h>
+
 #include "detection/detection_engine.h"
 #include "framework/data_bus.h"
 #include "profiler/profiler.h"
@@ -155,6 +158,233 @@ bool get_buf_mqtt_client_id(Packet* p, InspectionBuffer& b)
 }
 
 //-------------------------------------------------------------------------
+// MQTT packet parsing functions
+//-------------------------------------------------------------------------
+
+static int skip_remaining_length(const uint8_t* data, uint16_t dsize, uint32_t* remaining_len)
+{
+    int offset = 1;
+    uint32_t len = 0;
+    int shift = 0;
+    while (offset < 5 && offset < dsize) {
+        uint8_t byte = data[offset++];
+        len |= (byte & 0x7F) << shift;
+        shift += 7;
+        if ((byte & 0x80) == 0)
+            break;
+    }
+    if (remaining_len)
+        *remaining_len = len;
+    return offset;
+}
+
+static void parse_fixed_header(Packet* p, mqtt_session_data_t* ssn)
+{
+    if (p->dsize < 2)
+        return;
+    
+    uint8_t first_byte = p->data[0];
+    ssn->hdr_flags = first_byte;
+    ssn->msg_type = first_byte >> 4;
+    ssn->dup_flag = (first_byte >> 3) & 0x01;
+    ssn->qos = (first_byte >> 1) & 0x03;
+    ssn->retain = first_byte & 0x01;
+    skip_remaining_length(p->data, p->dsize, &ssn->remaining_len);
+}
+
+static bool parse_connect_packet(Packet* p, mqtt_session_data_t* ssn)
+{
+    if (p->dsize < 12)
+        return false;
+    
+    int offset = skip_remaining_length(p->data, p->dsize, nullptr);
+    
+    if (offset + 2 > p->dsize)
+        return false;
+    ssn->proto_len = (p->data[offset] << 8) | p->data[offset + 1];
+    offset += 2;
+    
+    if (offset + ssn->proto_len > p->dsize)
+        return false;
+    ssn->proto_name = p->data + offset;
+    offset += ssn->proto_len;
+    
+    if (offset + 4 > p->dsize)
+        return false;
+    ssn->protocol_version = p->data[offset];
+    ssn->connect_flags = p->data[offset + 1];
+    ssn->conflag_reserved = ssn->connect_flags & 0x01;
+    ssn->conflag_clean_session = (ssn->connect_flags >> 1) & 0x01;
+    ssn->conflag_will_flag = (ssn->connect_flags >> 2) & 0x01;
+    ssn->conflag_will_qos = (ssn->connect_flags >> 3) & 0x03;
+    ssn->conflag_will_retain = (ssn->connect_flags >> 5) & 0x01;
+    ssn->conflag_passwd = (ssn->connect_flags >> 6) & 0x01;
+    ssn->conflag_uname = (ssn->connect_flags >> 7) & 0x01;
+    ssn->keep_alive = (p->data[offset + 2] << 8) | p->data[offset + 3];
+    offset += 4;
+    
+    if (offset + 2 > p->dsize)
+        return false;
+    ssn->client_id_len = (p->data[offset] << 8) | p->data[offset + 1];
+    offset += 2;
+    if (ssn->client_id_len > 0 && offset + ssn->client_id_len <= p->dsize) {
+        ssn->client_id = p->data + offset;
+        offset += ssn->client_id_len;
+    }
+    
+    if (ssn->conflag_will_flag) {
+        if (offset + 2 > p->dsize)
+            return true;
+        ssn->will_topic_len = (p->data[offset] << 8) | p->data[offset + 1];
+        offset += 2;
+        if (ssn->will_topic_len > 0 && offset + ssn->will_topic_len <= p->dsize) {
+            ssn->will_topic = p->data + offset;
+            offset += ssn->will_topic_len;
+        }
+        
+        if (offset + 2 > p->dsize)
+            return true;
+        ssn->will_msg_len = (p->data[offset] << 8) | p->data[offset + 1];
+        offset += 2;
+        if (ssn->will_msg_len > 0 && offset + ssn->will_msg_len <= p->dsize) {
+            ssn->will_msg = p->data + offset;
+            offset += ssn->will_msg_len;
+        }
+    }
+    
+    if (ssn->conflag_uname) {
+        if (offset + 2 > p->dsize)
+            return true;
+        ssn->username_len = (p->data[offset] << 8) | p->data[offset + 1];
+        offset += 2;
+        if (ssn->username_len > 0 && offset + ssn->username_len <= p->dsize) {
+            ssn->username = p->data + offset;
+            offset += ssn->username_len;
+        }
+    }
+    
+    if (ssn->conflag_passwd) {
+        if (offset + 2 > p->dsize)
+            return true;
+        ssn->passwd_len = (p->data[offset] << 8) | p->data[offset + 1];
+        offset += 2;
+        if (ssn->passwd_len > 0 && offset + ssn->passwd_len <= p->dsize) {
+            ssn->password = p->data + offset;
+        }
+    }
+    
+    return true;
+}
+
+static bool parse_connack_packet(Packet* p, mqtt_session_data_t* ssn)
+{
+    if (p->dsize < 4)
+        return false;
+    
+    int offset = skip_remaining_length(p->data, p->dsize, nullptr);
+    if (offset + 2 > p->dsize)
+        return false;
+    
+    ssn->conack_flags = p->data[offset];
+    ssn->conack_session_present = ssn->conack_flags & 0x01;
+    ssn->conack_reserved = (ssn->conack_flags >> 1) & 0x7F;
+    ssn->conack_return_code = p->data[offset + 1];
+    
+    return true;
+}
+
+static bool parse_publish_packet(Packet* p, mqtt_session_data_t* ssn)
+{
+    int offset = skip_remaining_length(p->data, p->dsize, nullptr);
+    
+    if (offset + 2 > p->dsize)
+        return false;
+    ssn->topic_len = (p->data[offset] << 8) | p->data[offset + 1];
+    offset += 2;
+    
+    if (offset + ssn->topic_len > p->dsize)
+        return false;
+    ssn->topic = p->data + offset;
+    offset += ssn->topic_len;
+    
+    if (ssn->qos > 0) {
+        if (offset + 2 > p->dsize)
+            return false;
+        ssn->msg_id = (p->data[offset] << 8) | p->data[offset + 1];
+        offset += 2;
+    }
+    
+    if (offset < p->dsize) {
+        ssn->payload = p->data + offset;
+        ssn->payload_len = p->dsize - offset;
+    }
+    
+    return true;
+}
+
+static bool parse_subscribe_packet(Packet* p, mqtt_session_data_t* ssn)
+{
+    int offset = skip_remaining_length(p->data, p->dsize, nullptr);
+    
+    if (offset + 2 > p->dsize)
+        return false;
+    ssn->msg_id = (p->data[offset] << 8) | p->data[offset + 1];
+    offset += 2;
+    
+    ssn->sub_qos_count = 0;
+    while (offset + 2 < p->dsize && ssn->sub_qos_count < 8) {
+        uint16_t topic_len = (p->data[offset] << 8) | p->data[offset + 1];
+        offset += 2 + topic_len;
+        if (offset < p->dsize) {
+            ssn->sub_qos[ssn->sub_qos_count++] = p->data[offset] & 0x03;
+            offset++;
+        }
+    }
+    
+    return true;
+}
+
+static bool parse_suback_packet(Packet* p, mqtt_session_data_t* ssn)
+{
+    int offset = skip_remaining_length(p->data, p->dsize, nullptr);
+    
+    if (offset + 2 > p->dsize)
+        return false;
+    ssn->msg_id = (p->data[offset] << 8) | p->data[offset + 1];
+    offset += 2;
+    
+    ssn->suback_qos_count = 0;
+    while (offset < p->dsize && ssn->suback_qos_count < 8) {
+        ssn->suback_qos[ssn->suback_qos_count++] = p->data[offset];
+        offset++;
+    }
+    
+    return true;
+}
+
+static bool parse_unsubscribe_packet(Packet* p, mqtt_session_data_t* ssn)
+{
+    int offset = skip_remaining_length(p->data, p->dsize, nullptr);
+    
+    if (offset + 2 > p->dsize)
+        return false;
+    ssn->msg_id = (p->data[offset] << 8) | p->data[offset + 1];
+    
+    return true;
+}
+
+static bool parse_ack_packet(Packet* p, mqtt_session_data_t* ssn)
+{
+    int offset = skip_remaining_length(p->data, p->dsize, nullptr);
+    
+    if (offset + 2 > p->dsize)
+        return false;
+    ssn->msg_id = (p->data[offset] << 8) | p->data[offset + 1];
+    
+    return true;
+}
+
+//-------------------------------------------------------------------------
 // flow stuff
 //-------------------------------------------------------------------------
 
@@ -165,9 +395,10 @@ void MqttFlowData::init()
     inspector_id = FlowData::create_flow_data_id();
 }
 
-MqttFlowData::MqttFlowData() : FlowData(inspector_id)
+MqttFlowData::MqttFlowData() : FlowData(inspector_id) // naming inspired by modbus
 {
     reset();
+    memset(&timing, 0, sizeof(timing));
     mqtt_stats.concurrent_sessions++;
     if(mqtt_stats.max_concurrent_sessions < mqtt_stats.concurrent_sessions)
         mqtt_stats.max_concurrent_sessions = mqtt_stats.concurrent_sessions;
@@ -177,6 +408,64 @@ MqttFlowData::~MqttFlowData()
 {
     assert(mqtt_stats.concurrent_sessions > 0);
     mqtt_stats.concurrent_sessions--;
+}
+
+void MqttFlowData::update_timing(const struct timeval& pkt_time)
+{
+    if (timing.pkt_count == 0) {
+        timing.first_pkt_time = pkt_time;
+    }
+    timing.prev_pkt_time = pkt_time;
+    timing.pkt_count++;
+}
+
+int64_t MqttFlowData::get_time_delta_us() const
+{
+    if (timing.pkt_count < 2)
+        return 0;
+    return (timing.prev_pkt_time.tv_sec - timing.first_pkt_time.tv_sec) * 1000000LL +
+           (timing.prev_pkt_time.tv_usec - timing.first_pkt_time.tv_usec);
+}
+
+int64_t MqttFlowData::get_time_relative_us() const
+{
+    if (timing.pkt_count == 0)
+        return 0;
+    return (timing.prev_pkt_time.tv_sec - timing.first_pkt_time.tv_sec) * 1000000LL +
+           (timing.prev_pkt_time.tv_usec - timing.first_pkt_time.tv_usec);
+}
+
+void MqttFlowData::record_auth_failure(const struct timeval& pkt_time)
+{
+    timing.failed_auth_count++;
+    
+    if (timing.failed_auth_window_count == 0) {
+        timing.failed_auth_window_start = pkt_time;
+        timing.failed_auth_window_count = 1;
+    } else {
+        int64_t window_elapsed = (pkt_time.tv_sec - timing.failed_auth_window_start.tv_sec) * 1000000LL +
+                                 (pkt_time.tv_usec - timing.failed_auth_window_start.tv_usec);
+        if (window_elapsed > 1000000) {
+            timing.failed_auth_window_start = pkt_time;
+            timing.failed_auth_window_count = 1;
+        } else {
+            timing.failed_auth_window_count++;
+        }
+    }
+}
+
+float MqttFlowData::get_failed_auth_per_second(const struct timeval& pkt_time) const
+{
+    if (timing.failed_auth_window_count == 0)
+        return 0.0f;
+    
+    int64_t window_elapsed = (pkt_time.tv_sec - timing.failed_auth_window_start.tv_sec) * 1000000LL +
+                             (pkt_time.tv_usec - timing.failed_auth_window_start.tv_usec);
+    
+    if (window_elapsed <= 0)
+        return static_cast<float>(timing.failed_auth_window_count);
+    
+    return static_cast<float>(timing.failed_auth_window_count) * 1000000.0f / static_cast<float>(window_elapsed);
 }
 
 //-------------------------------------------------------------------------
@@ -240,41 +529,80 @@ void Mqtt::eval(Packet* p)
 
     mqtt_stats.frames++;
 
-    // Parse packet type from first byte
     if (p->dsize < 2)
         return;
 
-    uint8_t first_byte = p->data[0];
-    uint8_t packet_type = first_byte >> 4;
-    uint8_t qos = (first_byte >> 1) & 0x03;
+    mfd->reset();
+    
+    struct timeval pkt_time;
+    if (p->pkth)
+        pkt_time = { static_cast<time_t>(p->pkth->ts.tv_sec), 
+                     static_cast<suseconds_t>(p->pkth->ts.tv_usec) };
+    else
+        gettimeofday(&pkt_time, nullptr);
+    mfd->update_timing(pkt_time);
 
-    // Store in flow data
-    mfd->ssn_data.packet_type = packet_type;
-    mfd->ssn_data.qos = qos;
+    parse_fixed_header(p, &mfd->ssn_data);
+    
+    uint8_t msg_type = mfd->ssn_data.msg_type;
 
-    // Publish events based on packet type
-    if (packet_type == 3)  // PUBLISH
+    switch (msg_type)
     {
-        InspectionBuffer topic_buf, payload_buf;
-        if (get_buf_mqtt_topic(p, topic_buf) && get_buf_mqtt_payload(p, payload_buf))
+    case 1:  // CONNECT
+        parse_connect_packet(p, &mfd->ssn_data); // Step 1: Parse raw bytes into ssn_data
+    {
         {
-            MqttPublishEvent event(topic_buf.data, topic_buf.len,
-                                   payload_buf.data, payload_buf.len, qos);
+            MqttConnectEvent event(mfd->ssn_data.client_id, mfd->ssn_data.client_id_len); // Step 2: Package ssn_data fields into an Event object
+            // Step 3: Publish the event (subscribers receive it); The Event is a "data package" sent via DataBus.
+            DataBus::publish(mqtt_pub_id, MqttEventIds::MQTT_CONNECT, event, p->flow); // Defined in: data_bus.h:117
+        }
+        break;
+        
+    case 2:  // CONNACK
+        parse_connack_packet(p, &mfd->ssn_data);
+        if (mfd->ssn_data.conack_return_code != 0) {
+            mfd->record_auth_failure(pkt_time);
+        }
+        break;
+        
+    case 3:  // PUBLISH
+        parse_publish_packet(p, &mfd->ssn_data);
+        {
+            MqttPublishEvent event(mfd->ssn_data.topic, mfd->ssn_data.topic_len,
+                                   mfd->ssn_data.payload, mfd->ssn_data.payload_len,
+                                   mfd->ssn_data.qos);
             DataBus::publish(mqtt_pub_id, MqttEventIds::MQTT_PUBLISH, event, p->flow);
         }
-    }
-    else if (packet_type == 1)  // CONNECT
-    {
-        InspectionBuffer client_id_buf;
-        const uint8_t* cid = nullptr;
-        uint16_t cid_len = 0;
-        if (get_buf_mqtt_client_id(p, client_id_buf))
-        {
-            cid = client_id_buf.data;
-            cid_len = client_id_buf.len;
-        }
-        MqttConnectEvent event(cid, cid_len);
-        DataBus::publish(mqtt_pub_id, MqttEventIds::MQTT_CONNECT, event, p->flow);
+        break;
+        
+    case 4:  // PUBACK
+    case 5:  // PUBREC
+    case 6:  // PUBREL
+    case 7:  // PUBCOMP
+    case 11: // UNSUBACK
+        parse_ack_packet(p, &mfd->ssn_data);
+        break;
+        
+    case 8:  // SUBSCRIBE
+        parse_subscribe_packet(p, &mfd->ssn_data);
+        break;
+        
+    case 9:  // SUBACK
+        parse_suback_packet(p, &mfd->ssn_data);
+        break;
+        
+    case 10: // UNSUBSCRIBE
+        parse_unsubscribe_packet(p, &mfd->ssn_data);
+        break;
+        
+    case 12: // PINGREQ
+    case 13: // PINGRESP
+    case 14: // DISCONNECT
+        break;
+        
+    default:
+        DetectionEngine::queue_event(GID_MQTT, MQTT_RESERVED_TYPE);
+        break;
     }
 }
 
@@ -349,7 +677,7 @@ extern const BaseApi* ips_mqtt_payload;
 #ifdef BUILDING_SO
 SO_PUBLIC const BaseApi* snort_plugins[]
 #else
-const BaseApi* sin_mqtt[]
+const BaseApi* sin_mqtt[] =
 #endif
 {
     &mqtt_api.base,
