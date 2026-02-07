@@ -454,10 +454,10 @@ void MqttFlowData::record_auth_failure(const struct timeval& pkt_time)
     }
 }
 
-float MqttFlowData::get_failed_auth_per_second(const struct timeval& pkt_time) const
+float MqttFlowData::get_failed_auth_per_second(const struct timeval& pkt_time) const // return a decimal number (failures per second), input is current packet's timestamp (passed by reference) and const at end means this function doesn't modify any member variables
 {
-    if (timing.failed_auth_window_count == 0)
-        return 0.0f;
+    if (timing.failed_auth_window_count == 0) 
+        return 0.0f; // If no failures have been recorded in the current window, return 0.0
     
     int64_t window_elapsed = (pkt_time.tv_sec - timing.failed_auth_window_start.tv_sec) * 1000000LL +
                              (pkt_time.tv_usec - timing.failed_auth_window_start.tv_usec);
@@ -466,6 +466,8 @@ float MqttFlowData::get_failed_auth_per_second(const struct timeval& pkt_time) c
         return static_cast<float>(timing.failed_auth_window_count);
     
     return static_cast<float>(timing.failed_auth_window_count) * 1000000.0f / static_cast<float>(window_elapsed);
+    // (failures × 1,000,000) / elapsed_microseconds = failures per second 
+    // to convert seconds to microseconds
 }
 
 //-------------------------------------------------------------------------
@@ -723,3 +725,4 @@ const BaseApi* sin_mqtt[] =
     ips_mqtt_payload,
     nullptr
 };
+

@@ -8,9 +8,67 @@
 | **Malformed** | `mqtt.len`, `mqtt.msgtype`, `mqtt.protoname`, validation errors |
 | **Malaria DoS** | `mqtt.qos`, `mqtt.msgtype`, message rates |
 
+> Why care about TCP flags (`p->ptrs.tcph->th_flags`) for Flooding DoS?
+
+> Attacker sends many SYN packets without completing handshake → exhausts server's half-open connection table. Many SYN with no corresponding ACK is a sign for the ML model
+
+> Why `mqtt.qos` matters for SlowITe attack?
+
+> 
+>**QoS 0**: *Fire-and-forget* (no acknowledgment)
+>
+>**QoS 1**: *At-least-once* (requires PUBACK)
+>
+>**QoS 2**: *Exactly-once* (requires 4-way handshake: PUBLISH→PUBREC→PUBREL→PUBCOMP)
+>
+>**The attack**:
+>
+>Client sends PUBLISH with QoS 2
+>
+>Broker responds with PUBREC, waits for PUBREL
+>
+>Attacker never sends PUBREL → broker keeps session state open indefinitely
+>
+>Repeat → exhaust broker's memory/connection pool
+
 ---
 
 ## Architecture for Production-Ready Real-Time Detection
+1. Snort starts
+2. Reads snort.lua
+3. Sees "mqtt = { }" → Creates MqttModule → Creates Mqtt inspector
+4. Sees "mqtt_ml = {...}" → Creates MqttMLModule → Creates MqttML inspector
+5. `MqttML::configure()` subscribes to DataBus (Each inspector has its own configure() method, they all inherit from inspector.cc, which does nothing and return true but it can be overwritten for different purposes)
+    - What is **DataBus**?
+    - DataBus is Snort3's **publish-subscribe (pub/sub) messaging system**.
+    ```
+    Snort startup
+    │
+    ├── Load all inspector modules
+    ├── Create inspector instances (mqtt_ctor, mqtt_ml_ctor called)
+    ├── Call configure() on each inspector   ← HERE
+    │       • MqttML::configure() → subscribes to DataBus
+    │       • Mqtt::configure() → does nothing (default)
+    │
+    └── Start packet processing loop
+            └── For each packet: call eval()
+    ```
+
+6. Packet arrives on port 1883 → `Mqtt::eval()` called → publishes MqttFeatureEvent
+    - This is done via the binder in snort.lua:
+    ````
+    binder = {
+    { when = { proto = 'tcp', ports = '1883' }, 
+      use = { type = 'mqtt' } }
+    }
+    ````
+    - **DAQ** (Data Acquisition) captures packet on **port 1883**
+    - **Stream** (TCP reassembly) builds **complete PDU**
+    - **Binder** sees port **1883** → **assigns mqtt as the service inspector**
+    - Snort calls **Mqtt::eval(p)** with the packet
+    - **eval() parses**, then **publishes MqttFeatureEvent**
+    - **DataBus** routes event to all subscribers (including **MqttFeatureHandler**)
+7. `MqttFeatureHandler::handle()` receives event → runs ML
 
 ```
                     REAL-TIME PIPELINE
@@ -25,8 +83,8 @@
 │           │                                                     │
 │           ▼                                                     │
 │  ┌─────────────────┐     ┌──────────────────┐                   │
-│  │  mqtt inspector │────▶│  MqttFeatureEvent │                  │
-│  │                 │     │  (via DataBus)    │                  │
+│  │  mqtt inspector │────▶│  MqttFeatureEvent│                   │
+│  │                 │     │  (via DataBus)   │                   │
 │  │ • Parse packet  │     └─────────┬────────┘                   │
 │  │ • Extract fields│               │                            │
 │  │ • Calc timing   │               ▼                            │
@@ -60,6 +118,53 @@ MQTT Inspector                    DataBus                    ML Handler
       │                              │           event.get_client_id()
       │                              │           (ML uses this)   │
 ```
+#### The handler IS how DataBus routes to the ML inspector. The handler is the receiving end of the pub/sub pattern. It's like subscribing to a newsletter: you need a mailbox (handler) to receive it.
+```
+Mqtt::eval()  ─────publish(MqttFeatureEvent)───→  DataBus
+                                                     │
+                                                     │ routes to subscribers
+                                                     ▼
+                                           MqttFeatureHandler::handle()
+                                           (inside mqtt_ml inspector)
+```
+
+
+#### Are MqttModule and MqttMLModule two independent inspectors, like modbus and mqtt are independent? 
+
+>YES, They are two separate, independent inspectors that communicate via DataBus:
+
+```
+┌─────────────────────────────┐       ┌─────────────────────────────┐
+│  modbus                     │       │  mqtt                       │
+│  (independent inspector)    │       │  (independent inspector)    │
+│  - Parses Modbus protocol   │       │ - Parses MQTT protocol      │
+│  - No connection to others  │       │ - Publishes MqttFeatureEvent│
+└─────────────────────────────┘       └──────────────┬──────────────┘
+                                                     │
+                                                     │ DataBus
+                                                     ▼
+                                      ┌─────────────────────────────┐
+                                      │  mqtt_ml                    │
+                                      │  (independent inspector)    │
+                                      │  - Subscribes to events     │
+                                      │  - Runs ML inference        │
+                                      └─────────────────────────────┘
+```
+**Key points:**
+
+| Aspect | mqtt | mqtt_ml |
+|--------|------|---------|
+| Can run alone? | ✅ Yes | ✅ Yes (but receives no events) |
+| Depends on other? | No | Needs mqtt to publish events |
+| Registered separately | `sin_mqtt[]` | `sin_mqtt_ml[]` |
+| Configured separately | `mqtt = { }` | `mqtt_ml = { threshold = 0.5 }` |
+
+**Why this design?**
+- **Modularity** - mqtt_ml can be disabled without touching mqtt
+- **Separation of concerns** - Parsing logic ≠ ML logic
+- **Reusability** - Other inspectors could also subscribe to MqttFeatureEvent
+- **Snort convention** - Same pattern as `http_inspect` → `snort_ml`
+---
 ## Field Extraction
 
 Here's what we have vs. what we need:
@@ -136,110 +241,6 @@ The Handler is the "bridge" because it:
 4. Calls the ML engine
 5. Decides whether to alert
 
----
-
-## Feature Importance Analysis for MQTT Attack Detection
-
-To prioritize which MQTT features are most relevant for attack detection, we perform a **feature importance analysis** using a Random Forest classifier.  
-
-### Concept
-
-A Random Forest is an ensemble of decision trees. Each tree learns to separate attacks (`label=1`) from benign traffic (`label=0`) by splitting on features that reduce uncertainty (measured as **Gini impurity** or **entropy**).  
-
-**Feature importance** quantifies how much each feature contributes to reducing uncertainty across all trees:  
-
-- **High importance** → the feature is critical for distinguishing attacks from normal traffic  
-- **Low importance** → the feature contributes little to prediction and can be deprioritized  
-
-This allows us to focus implementation efforts on the **top features** while avoiding unnecessary overhead.
-
-### Workflow
-
-1. **Load dataset**: All features from MqttSet are loaded, with the `label` column as the target.  
-2. **Train model**: A Random Forest classifier is trained on all features.  
-3. **Compute importance**: For each feature, the total decrease in impurity across all trees is calculated and normalized.  
-4. **Rank features**: Features are sorted by importance to identify the top contributors to attack detection.  
-
-**Example outcome (top features):**
-
-| Feature         | Importance |
-|-----------------|------------|
-| mqtt.kalive     | 0.31       |
-| time_delta      | 0.22       |
-| mqtt.conack.val | 0.18       |
-| tcp.len         | 0.11       |
-| mqtt.qos        | 0.03       |
-
-This analysis informs **which fields the MQTT inspector should prioritize extracting**, ensuring efficient and effective ML-based detection.
-
-````py
-#!/usr/bin/env python3
-import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
-import warnings
-import numpy as np
-warnings.filterwarnings('ignore')
-
-# Load data
-df = pd.read_csv('train70_reduced.csv')
-print(f"Dataset: {len(df)} rows, {len(df.columns)} columns")
-print(f"\nLabels: {df['target'].value_counts().to_dict()}")
-
-# Prepare features and target
-X = df.drop('target', axis=1)
-y = LabelEncoder().fit_transform(df['target'])
-
-# Handle non-numeric columns (convert hex strings and objects to numeric)
-for col in X.columns:
-    if X[col].dtype == 'object':
-        # Try to convert hex strings like '0x00000018' to integers
-        try:
-            X[col] = X[col].apply(lambda x: int(x, 16) if isinstance(x, str) and x.startswith('0x') else x)
-        except:
-            pass
-        # If still object type, convert to categorical codes
-        if X[col].dtype == 'object':
-            X[col] = pd.Categorical(X[col]).codes
-
-# Convert all to numeric, coerce errors to NaN
-X = X.apply(pd.to_numeric, errors='coerce')
-
-# Replace infinity with NaN, then fill NaN with -1
-X = X.replace([np.inf, -np.inf], np.nan)
-X = X.fillna(-1)
-
-# Ensure float32 range
-X = X.clip(-1e30, 1e30)
-
-# Train Random Forest
-print("\nTraining RandomForest for feature importance...")
-rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-rf.fit(X, y)
-
-# Get feature importance
-importance = pd.DataFrame({
-    'feature': X.columns,
-    'importance': rf.feature_importances_
-}).sort_values('importance', ascending=False)
-
-print("\n" + "="*60)
-print("MQTT FEATURE IMPORTANCE (Top 20)")
-print("="*60)
-for idx, row in importance.head(20).iterrows():
-    bar = "#" * int(row['importance'] * 100)
-    print(f"{row['feature']:35} {row['importance']:.4f} {bar}")
-
-print("\n" + "="*60)
-print("BOTTOM 10 (Likely Not Needed)")
-print("="*60)
-for idx, row in importance.tail(10).iterrows():
-    print(f"{row['feature']:35} {row['importance']:.4f}")
-
-# Save to CSV
-importance.to_csv('feature_importance_results.csv', index=False)
-print("\nResults saved to feature_importance_results.csv")
-````
 ---
 
 ## TASK CHECKLIST 📋 
@@ -332,6 +333,97 @@ print("\nResults saved to feature_importance_results.csv")
 | `failed_auth_per_second` | `get_failed_auth_per_second()` | Brute force detection rate |
 | `pkt_count` | `timing.pkt_count` | Packets in this flow |
 | `failed_auth_count` | `timing.failed_auth_count` | Total failed auths |
+
+#### Timing Logic Explained Step-by-Step
+
+```cpp
+void MqttFlowData::update_timing(const struct timeval& pkt_time)
+{
+    if (timing.pkt_count == 0) {           // Is this the FIRST packet?
+        timing.first_pkt_time = pkt_time;  // Remember when flow started
+    }
+    timing.prev_pkt_time = pkt_time;       // ALWAYS update "previous"
+    timing.pkt_count++;                    // Increment counter
+}
+```
+
+**Example with 3 packets:**
+
+| Packet # | `pkt_time` | `first_pkt_time` | `prev_pkt_time` | `pkt_count` |
+|----------|------------|------------------|-----------------|-------------|
+| Before any | - | 0 | 0 | 0 |
+| 1st | 10:00:00.000 | **10:00:00.000** | 10:00:00.000 | 1 |
+| 2nd | 10:00:00.500 | 10:00:00.000 | **10:00:00.500** | 2 |
+| 3rd | 10:00:01.200 | 10:00:00.000 | **10:00:01.200** | 3 |
+
+**Notice:**
+- `first_pkt_time` is set ONLY on the first packet, never changes
+- `prev_pkt_time` is updated for EVERY packet (it tracks "current" packet's time)
+
+**Then `get_time_delta_us()` calculates:**
+```cpp
+int64_t MqttFlowData::get_time_delta_us() const
+{
+    if (timing.pkt_count < 2)
+        return 0;  // Can't compute delta with only 1 packet
+    
+    // prev_pkt_time - first_pkt_time = time since flow started
+    return (timing.prev_pkt_time.tv_sec - timing.first_pkt_time.tv_sec) * 1000000LL +
+           (timing.prev_pkt_time.tv_usec - timing.first_pkt_time.tv_usec);
+}
+```
+
+**For packet #3:**
+```
+prev_pkt_time  = 10:00:01.200  (current packet)
+first_pkt_time = 10:00:00.000  (first packet)
+
+delta = (1 - 0) * 1,000,000 + (200,000 - 0)
+      = 1,000,000 + 200,000
+      = 1,200,000 microseconds
+      = 1.2 seconds since flow started
+```
+
+**Why do we call it `prev_pkt_time` if it's the current packet?**
+It's named for what it will be *after* `eval()` returns - when the *next* packet arrives, this will be the "previous" packet's time. Perhaps `last_pkt_time` would be a clearer name!
+
+````
+┌─────────────────────────────────────────────────────────────────────┐
+│  mqtt.h - Structure Definitions                                     │
+│                                                                     │
+│  struct mqtt_timing_data_t {                                        │
+│      uint32_t failed_auth_window_count;  // Member variable         │
+│      struct timeval failed_auth_window_start;                       │
+│      ...                                                            │
+│  };                                                                 │
+│                                                                     │
+│  class MqttFlowData {                                               │
+│      mqtt_timing_data_t timing;  // Contains the struct above       │
+│  };                                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  MqttFlowData() constructor                                         │
+│      memset(&timing, 0, sizeof(timing));  // All fields = 0         │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Mqtt::eval(Packet* p)                                              │
+│                                                                     │
+│  1. pkt_time = p->pkth->ts;  // Get timestamp from packet           │
+│                                                                     │
+│  2. if (CONNACK && return_code != 0)                                │
+│         mfd->record_auth_failure(pkt_time);                         │
+│         └── timing.failed_auth_window_count++ (incremented here)    │
+│                                                                     │
+│  3. fe.failed_auth_per_second = mfd->get_failed_auth_per_second();  │
+│         └── reads timing.failed_auth_window_count                   │
+│         └── calculates: count * 1000000 / elapsed_time              │
+└─────────────────────────────────────────────────────────────────────┘
+````
+---
 
 ### **Parsers Added:**
 
@@ -449,3 +541,31 @@ MQTT:        CONNECT  CONNACK  PUBLISH  PUBACK    DISCONNECT
 | `failed_auth_per_second` | Auth failures / time window | Brute force detection |
 
 ---
+### How is the training ?
+What we'll do with real data:
+```
+python mqtt_feature_extractor.py \
+    --normal_dir data/normal \
+    --attack_dir data/attack \
+    --output mqtt_features.csv
+# Result: thousands of samples
+
+python train_mqtt_model.py \
+    --data mqtt_features.csv \
+    --output mqtt_model.tflite \
+    --model_type autoencoder
+# Result: trained model
+```
+
+### The trained model is saved as a .tflite file. It contains:
+
+- The learned weights (patterns it learned)
+- The architecture (how to process the 28 inputs)
+
+When Snort loads this file, it can make predictions without re-training.
+
+- Training (once):
+    - PCAPs → 28 features → Model learns patterns → Save to mqtt_model.tflite
+
+- Inference (every packet):
+    - Live packet → 28 features → Load mqtt_model.tflite → "normal" or "attack"
