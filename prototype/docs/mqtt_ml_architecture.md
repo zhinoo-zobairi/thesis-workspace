@@ -545,15 +545,14 @@ MQTT:        CONNECT  CONNACK  PUBLISH  PUBACK    DISCONNECT
 What we'll do with real data:
 ```
 python mqtt_feature_extractor.py \
-    --normal_dir data/normal \
+    --benign_dir data/benign \
     --attack_dir data/attack \
     --output mqtt_features.csv
 # Result: thousands of samples
 
 python train_mqtt_model.py \
     --data mqtt_features.csv \
-    --output mqtt_model.tflite \
-    --model_type autoencoder
+    --output mqtt_model.tflite
 # Result: trained model
 ```
 
@@ -569,3 +568,342 @@ When Snort loads this file, it can make predictions without re-training.
 
 - Inference (every packet):
     - Live packet → 28 features → Load mqtt_model.tflite → "normal" or "attack"
+
+---
+
+## Model Training Deep Dive
+
+### Dataset Statistics (MQTTSet)
+
+| Category | Source Files | Sample Count |
+|----------|--------------|--------------|
+| **Benign** | `capture_1w.pcap` (1 week of normal traffic) | 7,510,014 |
+| **Attack - Malformed** | `malformed.pcap` | 3,656 |
+| **Attack - SlowITe** | `slowite.pcap` | 3,046 |
+| **Attack - Flooding** | `capture_flood.pcap` | 303 |
+| **Attack - Malaria DoS** | `capture_malariaDoS.pcap` | 93,150 |
+| **Attack - Brute Force** | `bruteforce.pcapng` | 2,921 |
+| **Total Attack** | 5 files | 103,076 |
+| **Total Dataset** | 6 files | **7,613,090** |
+
+**Class Imbalance Ratio:** ~73:1 (benign vs attack)
+
+> **Why this imbalance is acceptable:** The Autoencoder only trains on benign samples. It doesn't need attack samples during training—it learns "what normal looks like" and anything that doesn't reconstruct well is flagged as anomalous.
+
+---
+
+### Autoencoder Architecture
+
+```
+                    ENCODER                         DECODER
+              (Compression)                    (Reconstruction)
+                    
+Input (28)  →  Dense(16)  →  Dense(8)  →  Dense(16)  →  Dense(28)
+    │            │             │             │              │
+    │         ReLU          ReLU          ReLU          Sigmoid
+    │      BatchNorm     (Encoding)    BatchNorm           │
+    │       Dropout                     Dropout            │
+    │                                                      │
+    └──────────────── Compare (MSE Loss) ──────────────────┘
+```
+
+#### Layer-by-Layer Breakdown:
+
+| Layer | Parameters | Purpose |
+|-------|------------|---------|
+| **Input** | 28 features | Normalized MQTT packet features |
+| **Dense(16) + ReLU** | 28×16 + 16 = 464 | First compression layer |
+| **BatchNormalization** | 32 | Normalize activations for stable training |
+| **Dropout(0.2)** | 0 | Randomly zero 20% of neurons (prevents overfitting) |
+| **Dense(8) + ReLU** | 16×8 + 8 = 136 | **Bottleneck (encoding)** - compressed representation |
+| **Dense(16) + ReLU** | 8×16 + 16 = 144 | First decompression layer |
+| **BatchNormalization** | 32 | Normalize activations |
+| **Dropout(0.2)** | 0 | Regularization |
+| **Dense(28) + Sigmoid** | 16×28 + 28 = 476 | Reconstruct original input (0-1 range) |
+
+**Total Trainable Parameters:** ~1,284
+
+#### Why These Specific Dimensions?
+
+1. **28 → 16 → 8**: Gradual compression forces the network to learn the most important patterns
+2. **Bottleneck = 8**: Compresses 28 features to 8 dimensions (3.5x compression)
+3. **Sigmoid output**: All features are normalized to [0,1], so sigmoid is appropriate
+4. **Small network**: MQTT patterns are relatively simple; larger networks would overfit
+
+---
+
+### What is an Epoch?
+
+**Definition:** One epoch = one complete pass through the entire training dataset.
+
+```
+Training Data (4,806,409 benign samples after split)
+    │
+    ├── Epoch 1: Learn from ALL 4,806,409 samples once
+    ├── Epoch 2: Learn from ALL 4,806,409 samples again (weights updated)
+    ├── Epoch 3: Learn from ALL 4,806,409 samples again (better patterns)
+    │   ...
+    └── Epoch N: Convergence (loss stops improving)
+```
+
+**Why multiple epochs?**
+- First epoch: Model sees everything once, makes rough adjustments
+- Later epochs: Model refines its understanding, fine-tunes weights
+- Like reading a textbook multiple times—each pass deepens understanding
+
+---
+
+### What is a Batch?
+
+**Definition:** A batch is a subset of training samples processed together before updating weights.
+
+**Configuration:**
+- Batch size: 32 samples
+- Total benign training samples: ~4,806,409
+- Batches per epoch: 4,806,409 ÷ 32 = **150,201 batches**
+
+```
+Epoch 1:
+    Batch 1: Samples 1-32      → Calculate loss → Update weights
+    Batch 2: Samples 33-64     → Calculate loss → Update weights
+    ...
+    Batch 150,201: Last 32     → Calculate loss → Update weights
+    
+Epoch complete! Start Epoch 2...
+```
+
+**What you see in the terminal:**
+```
+57221/150201 ━━━━━━━━━━━━━━━━━━━━ 1:32 1ms/step - loss: 4.53
+  │      │                          │      │           │
+  │      │                          │      │           └── Current loss value
+  │      │                          │      └── Time per batch
+  │      │                          └── Time elapsed this epoch
+  │      └── Total batches in this epoch
+  └── Current batch number
+```
+
+---
+
+### Understanding Loss: Mean Squared Error (MSE)
+
+**What is Loss?**
+The loss function measures "how wrong" the model's predictions are.
+
+**For Autoencoders:**
+```
+Loss = MSE(input, reconstructed_output)
+     = mean((input - output)²)
+```
+
+**Example:**
+```
+Input feature vector:     [0.5, 0.3, 0.8, 0.1, ...]  (28 values)
+Reconstructed output:     [0.48, 0.32, 0.79, 0.12, ...]
+                              
+Difference squared:       [(0.02)², (0.02)², (0.01)², (0.02)², ...]
+                        = [0.0004, 0.0004, 0.0001, 0.0004, ...]
+                        
+MSE = mean of all differences = 0.000325
+```
+
+**Interpreting Loss Values:**
+
+| Loss Value | Interpretation |
+|------------|----------------|
+| `4.53` | Very high - model is essentially random (early training) |
+| `4.4898e-05` = 0.000045 | Excellent - model reconstructs with ~0.67% average error |
+| `2.69e-05` = 0.0000269 | Even better - model has learned normal patterns well |
+
+---
+
+### Training Progress Analysis (Your Actual Run)
+
+```
+Epoch 1/50: loss: 4.4898e-05, val_loss: 4.1822e-05
+Epoch 2/50: loss: 3.0125e-05, val_loss: 2.8282e-05  
+Epoch 3/50: loss: 3.9460e-05, val_loss: 2.6921e-05  ← Validation improving
+Epoch 4/50: loss: 3.5717e-05, val_loss: 5.1179e-05  ← Validation worse (noise)
+Epoch 5/50: loss: 3.4720e-05, val_loss: ???         ← In progress
+```
+
+**Key Metrics Explained:**
+
+| Metric | Meaning |
+|--------|---------|
+| `loss` | Reconstruction error on training data |
+| `val_loss` | Reconstruction error on held-out validation data (more important!) |
+| `learning_rate: 0.0010` | Step size for weight updates (0.001 = default Adam) |
+
+**What's Happening:**
+
+1. **Epoch 1 → 2:** Both losses dropped significantly → model is learning
+2. **Epoch 2 → 3:** Validation loss improved (2.82e-05 → 2.69e-05) → model generalizes well
+3. **Epoch 4:** Validation loss jumped (2.69e-05 → 5.12e-05) → likely noise, will recover
+
+---
+
+### Training/Validation/Test Split
+
+```
+Total Dataset: 7,613,090 samples
+        │
+        ├── Test Set (20%): 1,522,618 samples
+        │       (Never seen during training - final evaluation only)
+        │
+        └── Training Pool (80%): 6,090,472 samples
+                │
+                ├── Validation Set (20% of pool): 1,218,094 samples
+                │       (Monitor for overfitting during training)
+                │
+                └── Training Set (80% of pool): 4,872,378 samples
+                        │
+                        └── Filter: Benign only → ~4,806,409 samples
+                                (Autoencoder trains only on normal traffic)
+```
+
+**Why this split?**
+- **Training set**: What the model learns from
+- **Validation set**: Checks if model generalizes (not memorizing)
+- **Test set**: Final unbiased evaluation after training complete
+
+---
+
+### Callbacks: Automatic Training Management
+
+#### 1. Early Stopping
+```python
+EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+```
+
+**What it does:**
+- Monitors validation loss each epoch
+- If val_loss doesn't improve for 10 epochs, stops training
+- Restores weights from the best epoch (lowest val_loss)
+
+**Why?** Prevents overfitting—training too long makes the model memorize rather than learn patterns.
+
+#### 2. Learning Rate Reduction
+```python
+ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+```
+
+**What it does:**
+- If val_loss plateaus for 5 epochs, reduce learning rate by 50%
+- Allows finer adjustments when close to optimal
+
+**Analogy:** Like slowing down a car as you approach your destination for precise parking.
+
+---
+
+### How the Autoencoder Detects Attacks
+
+**Training (on benign data only):**
+```
+Benign packet → Encode → Decode → Compare → Small error ✓
+Benign packet → Encode → Decode → Compare → Small error ✓
+... millions of times ...
+Model learns: "This is what normal MQTT traffic looks like"
+```
+
+**Inference (on any packet):**
+```
+Benign packet → Encode → Decode → Compare → Small error → NORMAL
+Attack packet → Encode → Decode → Compare → LARGE error → ALERT!
+```
+
+**Why attacks have high reconstruction error:**
+- The model has NEVER seen attack patterns during training
+- It doesn't know how to compress/decompress attack features
+- The "bottleneck" forces it to learn efficient representations of NORMAL data only
+- Attacks are anomalies that don't fit the learned representation
+
+---
+
+### Threshold Selection
+
+After training, we calculate a threshold using the 95th percentile of reconstruction errors on normal validation data:
+
+```python
+# On normal validation data only
+errors = [MSE(input, reconstruct(input)) for input in validation_benign]
+threshold = percentile(errors, 95)
+```
+
+**Interpretation:**
+- 95% of normal traffic has error below threshold
+- 5% false positive rate on normal traffic (acceptable tradeoff)
+- Attack traffic should have much higher error → detected
+
+**Decision Rule:**
+```
+if reconstruction_error > threshold:
+    alert("MQTT Attack Detected")
+else:
+    pass  # Normal traffic
+```
+
+---
+
+### TensorFlow Lite Export
+
+**Why TF Lite?**
+- Regular TensorFlow: ~500MB runtime, Python-dependent
+- TF Lite: ~2MB runtime, C++ compatible, optimized for edge devices
+
+**Export Process:**
+```python
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]  # Quantization
+tflite_model = converter.convert()
+```
+
+**Output Files:**
+- `mqtt_model.tflite`: The model (~10-50KB)
+- `mqtt_model.threshold`: The anomaly threshold value
+
+**Integration with Snort:**
+```cpp
+// In mqtt_ml.cc run_inference()
+float error = compute_reconstruction_error(features);
+if (error > threshold)
+    DetectionEngine::queue_event(MQTT_ML_ANOMALY);
+```
+
+---
+
+### Expected Final Results
+
+After training completes, you'll see:
+
+```
+============================================================
+Autoencoder Evaluation (Reconstruction Error)
+============================================================
+
+Threshold: 0.000XXX
+
+Classification Report:
+              precision    recall  f1-score   support
+
+      Normal       0.XX      0.XX      0.XX    XXXXXX
+      Attack       0.XX      0.XX      0.XX     XXXXX
+
+Confusion Matrix:
+[[TN  FP]
+ [FN  TP]]
+
+ROC AUC: 0.XXXX
+
+============================================================
+Training Complete!
+============================================================
+Model saved to: mqtt_model.tflite
+Threshold: 0.XXXXXX
+```
+
+**Metrics to Report:**
+- **ROC AUC**: Area Under ROC Curve (0.5 = random, 1.0 = perfect)
+- **Precision**: Of all predicted attacks, how many were real attacks?
+- **Recall**: Of all real attacks, how many did we detect?
+- **F1-Score**: Harmonic mean of precision and recall

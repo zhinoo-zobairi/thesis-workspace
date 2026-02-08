@@ -20,7 +20,7 @@ import struct
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
-from scapy.all import rdpcap, TCP, IP, Raw
+from scapy.all import PcapReader, TCP, IP, Raw
 from scapy.layers.inet6 import IPv6
 
 # =============================================================================
@@ -470,12 +470,18 @@ def process_pcap(pcap_path: Path, flow_tracker: FlowTracker,
     results = []
     
     try:
-        packets = rdpcap(str(pcap_path))
+        # Use PcapReader for streaming (low memory) instead of rdpcap (loads all)
+        reader = PcapReader(str(pcap_path))
     except Exception as e:
         print(f"Error reading {pcap_path}: {e}")
         return results
     
-    for pkt in packets:
+    pkt_count = 0
+    for pkt in reader:
+        pkt_count += 1
+        if pkt_count % 100000 == 0:
+            print(f"    Processed {pkt_count} packets, {len(results)} MQTT samples...")
+        
         # Get MQTT payload
         mqtt_data = extract_mqtt_payload(pkt)
         if mqtt_data is None or len(mqtt_data) < 2:
@@ -514,19 +520,22 @@ def process_pcap(pcap_path: Path, flow_tracker: FlowTracker,
         
         results.append((features, label))
     
+    reader.close()
     return results
 
 
-def process_dataset(pcap_dirs: Dict[str, int], output_path: Path):
+def process_dataset(pcap_dirs: Dict[str, int], output_path: Path, delete_pcaps_after: bool = False):
     """
     Process all PCAPs in directories and write features to CSV.
     
     Args:
         pcap_dirs: Dict mapping directory path to label (0=normal, 1=attack)
         output_path: Path to output CSV file
+        delete_pcaps_after: If True, delete PCAP files after extraction to free disk space
     """
     flow_tracker = FlowTracker()
     all_samples = []
+    all_pcap_files = []  # Track for deletion
     
     # Feature names for CSV header
     feature_names = [
@@ -547,12 +556,26 @@ def process_dataset(pcap_dirs: Dict[str, int], output_path: Path):
         
         label_name = "normal" if label == 0 else "attack"
         pcap_files = list(pcap_path.glob("*.pcap")) + list(pcap_path.glob("*.pcapng"))
+        all_pcap_files.extend(pcap_files)
         print(f"Processing {len(pcap_files)} PCAP files from {pcap_dir} (label: {label_name})")
         
         for pcap_file in pcap_files:
             samples = process_pcap(pcap_file, flow_tracker, label)
             all_samples.extend(samples)
             print(f"  {pcap_file.name}: {len(samples)} samples")
+    
+    # Delete PCAPs if requested (frees disk space before CSV write)
+    if delete_pcaps_after:
+        print(f"\nDeleting {len(all_pcap_files)} PCAP files to free disk space...")
+        import os
+        freed_bytes = 0
+        for pcap_file in all_pcap_files:
+            try:
+                freed_bytes += pcap_file.stat().st_size
+                os.remove(pcap_file)
+            except Exception as e:
+                print(f"  Warning: Could not delete {pcap_file}: {e}")
+        print(f"  Freed {freed_bytes / (1024*1024*1024):.2f} GB")
     
     # Write to CSV
     print(f"\nWriting {len(all_samples)} samples to {output_path}")
@@ -589,6 +612,11 @@ def main():
         default="mqtt_features.csv",
         help="Output CSV file path (default: mqtt_features.csv)"
     )
+    parser.add_argument(
+        "--delete_pcaps_after",
+        action="store_true",
+        help="Delete PCAP files after extraction to free disk space before writing CSV"
+    )
     
     args = parser.parse_args()
     
@@ -602,7 +630,7 @@ def main():
         print("Error: Please specify at least one PCAP directory (--benign_dir or --attack_dir)")
         return 1
     
-    process_dataset(pcap_dirs, Path(args.output))
+    process_dataset(pcap_dirs, Path(args.output), args.delete_pcaps_after)
     return 0
 
 
