@@ -42,6 +42,12 @@ static const Parameter mqtt_ml_params[] =
     { "enabled", Parameter::PT_BOOL, nullptr, "true",
       "enable or disable ML-based anomaly detection" },
 
+    { "model_path", Parameter::PT_STRING, nullptr, nullptr,
+      "path to TF Lite model file (.tflite)" },
+
+    { "threshold_path", Parameter::PT_STRING, nullptr, nullptr,
+      "path to threshold file (overrides anomaly_threshold)" },
+
     { nullptr, Parameter::PT_MAX, nullptr, nullptr, nullptr }
 };
 
@@ -86,6 +92,10 @@ bool MqttMLModule::set(const char*, Value& v, SnortConfig*)
         conf.anomaly_threshold = v.get_real();
     else if (v.is("enabled"))
         conf.enabled = v.get_bool();
+    else if (v.is("model_path"))
+        conf.model_path = v.get_string();
+    else if (v.is("threshold_path"))
+        conf.threshold_path = v.get_string();
     else
         return false;
 

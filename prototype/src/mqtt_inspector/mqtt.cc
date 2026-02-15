@@ -20,9 +20,6 @@ using namespace snort;
 
 THREAD_LOCAL MqttStats mqtt_stats;
 
-// Publisher ID for MQTT events (initialized in mqtt_init)
-static THREAD_LOCAL unsigned mqtt_pub_id = 0;
-
 // Indices in the buffer array exposed by InspectApi
 // Must remain synchronized with mqtt_bufs
 enum MqttBufId
@@ -454,10 +451,10 @@ void MqttFlowData::record_auth_failure(const struct timeval& pkt_time)
     }
 }
 
-float MqttFlowData::get_failed_auth_per_second(const struct timeval& pkt_time) const // return a decimal number (failures per second), input is current packet's timestamp (passed by reference) and const at end means this function doesn't modify any member variables
+float MqttFlowData::get_failed_auth_per_second(const struct timeval& pkt_time) const
 {
-    if (timing.failed_auth_window_count == 0) 
-        return 0.0f; // If no failures have been recorded in the current window, return 0.0
+    if (timing.failed_auth_window_count == 0)
+        return 0.0f;
     
     int64_t window_elapsed = (pkt_time.tv_sec - timing.failed_auth_window_start.tv_sec) * 1000000LL +
                              (pkt_time.tv_usec - timing.failed_auth_window_start.tv_usec);
@@ -466,8 +463,6 @@ float MqttFlowData::get_failed_auth_per_second(const struct timeval& pkt_time) c
         return static_cast<float>(timing.failed_auth_window_count);
     
     return static_cast<float>(timing.failed_auth_window_count) * 1000000.0f / static_cast<float>(window_elapsed);
-    // (failures × 1,000,000) / elapsed_microseconds = failures per second 
-    // to convert seconds to microseconds
 }
 
 //-------------------------------------------------------------------------
@@ -501,7 +496,7 @@ void Mqtt::eval(Packet* p)
     Profile profile(mqtt_prof);   // cppcheck-suppress unreadVariable
 
     // Preconditions - what we registered for
-    assert(p->has_tcp_data());
+    assert(p->has_tcp_data()); // Only called when payload exists
 
     MqttFlowData* mfd =
         (MqttFlowData*)p->flow->get_flow_data(MqttFlowData::inspector_id);
@@ -642,7 +637,7 @@ void Mqtt::eval(Packet* p)
         // Flow statistics
         fe.pkt_count = mfd->timing.pkt_count;
         
-        DataBus::publish(mqtt_pub_id, MqttEventIds::MQTT_FEATURE, fe, p->flow); // fe destroyed here (destructor called, because scope or block ends – Without block, fe exists until end of function)
+        DataBus::publish(DataBus::get_id(mqtt_pub_key), MqttEventIds::MQTT_FEATURE, fe, p->flow);
     }
 }
 
@@ -659,7 +654,6 @@ static void mod_dtor(Module* m)
 static void mqtt_init()
 {
     MqttFlowData::init();
-    mqtt_pub_id = DataBus::get_id(mqtt_pub_key);
 }
 
 static Inspector* mqtt_ctor(Module*)
@@ -725,4 +719,3 @@ const BaseApi* sin_mqtt[] =
     ips_mqtt_payload,
     nullptr
 };
-

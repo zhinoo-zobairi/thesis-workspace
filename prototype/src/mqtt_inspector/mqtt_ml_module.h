@@ -26,6 +26,8 @@
 #include "main/thread.h"
 #include "profiler/profiler.h"
 
+#include <string>
+
 #define MQTT_ML_GID 412
 #define MQTT_ML_SID 1
 
@@ -48,6 +50,8 @@ struct MqttMLConfig
 {
     double anomaly_threshold;  // Threshold for anomaly detection (0.0 - 1.0)
     bool enabled;              // Whether ML detection is enabled
+    std::string model_path;    // Path to TF Lite model file
+    std::string threshold_path; // Path to threshold file
 };
 
 class MqttMLModule : public snort::Module

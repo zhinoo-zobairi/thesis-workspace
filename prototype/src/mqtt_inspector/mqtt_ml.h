@@ -25,10 +25,15 @@
 #include "framework/inspector.h"
 #include "mqtt_ml_module.h"
 
+#ifdef HAVE_TFLITE
+#include "tensorflow/lite/c/c_api.h"
+#endif
+
 class MqttML : public snort::Inspector
 {
 public:
     MqttML(const MqttMLConfig& c) : conf(c) {}
+    ~MqttML() override;
 
     void show(const snort::SnortConfig*) const override;
     void eval(snort::Packet*) override {}  // We use DataBus, not packet eval
@@ -37,8 +42,24 @@ public:
     const MqttMLConfig& get_config() const
     { return conf; }
 
+    // TF Lite model access for the handler
+    float run_model(const float* input, float* output, size_t num_features) const;
+    bool is_model_loaded() const { return model_loaded; }
+    float get_threshold() const { return threshold; }
+
 private:
     MqttMLConfig conf;
+    bool model_loaded = false;
+    float threshold = 0.5f;
+
+    bool load_model();
+    bool load_threshold();
+
+#ifdef HAVE_TFLITE
+    TfLiteModel* model = nullptr;
+    TfLiteInterpreter* interpreter = nullptr;
+    TfLiteInterpreterOptions* options = nullptr;
+#endif
 };
 
 #endif

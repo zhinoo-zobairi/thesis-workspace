@@ -2,6 +2,10 @@ set( FILE_LIST
     mqtt.cc
     mqtt.h
     mqtt_events.h
+    mqtt_ml.cc
+    mqtt_ml.h
+    mqtt_ml_module.cc
+    mqtt_ml_module.h
     mqtt_module.cc
     mqtt_module.h
     mqtt_paf.cc
@@ -17,4 +21,3 @@ else (STATIC_INSPECTORS)
     add_dynamic_module(mqtt inspectors ${FILE_LIST})
 
 endif (STATIC_INSPECTORS)
-

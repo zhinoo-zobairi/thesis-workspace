@@ -13,7 +13,7 @@
 //
 // You should have received a copy of the GNU General Public License along
 // with this program; if not, write to the Free Software Foundation, Inc.,
-// 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+// 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 //--------------------------------------------------------------------------
 
 // mqtt_ml.cc author Zhinoo Zobairi
@@ -27,6 +27,9 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstring>
+#include <fstream>
+#include <string>
 
 #include "detection/detection_engine.h"
 #include "framework/data_bus.h"
@@ -36,6 +39,63 @@
 #include "mqtt_events.h"
 
 using namespace snort;
+
+//--------------------------------------------------------------------------
+// Feature Vector Constants and Normalization
+//--------------------------------------------------------------------------
+
+// Number of features in our feature vector
+// This must match what the ML model expects!
+static constexpr size_t MQTT_ML_NUM_FEATURES = 28;
+
+// Max values for log normalization of unbounded features
+// These are tuned based on expected traffic patterns
+static constexpr float MAX_REMAINING_LEN = 268435455.0f;  // MQTT max (4 bytes, 7 bits each)
+static constexpr float MAX_KEEP_ALIVE = 65535.0f;         // 2 bytes
+static constexpr float MAX_STRING_LEN = 65535.0f;         // MQTT string length is 2 bytes
+static constexpr float MAX_PAYLOAD_LEN = 268435455.0f;    // Same as remaining_len
+static constexpr float MAX_TIME_DELTA_US = 60000000.0f;   // 60 seconds in microseconds
+static constexpr float MAX_FAILED_AUTH_RATE = 100.0f;     // 100 failures/sec is extreme
+static constexpr float MAX_PKT_COUNT = 10000.0f;          // Packets per flow
+
+//--------------------------------------------------------------------------
+// Normalization Helper Functions
+//--------------------------------------------------------------------------
+
+// Min-max normalization: (value - min) / (max - min)
+// Result is in range [0.0, 1.0]
+static inline float normalize_minmax(float value, float min_val, float max_val)
+{
+    if (max_val <= min_val)
+        return 0.0f;
+    float result = (value - min_val) / (max_val - min_val);
+    // Clamp to [0, 1] in case value is outside expected range
+    if (result < 0.0f) result = 0.0f;
+    if (result > 1.0f) result = 1.0f;
+    return result;
+}
+
+// Log normalization: log(value + 1) / log(max + 1)
+// Good for unbounded values that can vary by orders of magnitude
+// +1 prevents log(0) which is undefined
+static inline float normalize_log(float value, float max_val)
+{
+    if (value <= 0.0f)
+        return 0.0f;
+    if (max_val <= 0.0f)
+        return 0.0f;
+    float log_val = std::log(value + 1.0f);
+    float log_max = std::log(max_val + 1.0f);
+    float result = log_val / log_max;
+    if (result > 1.0f) result = 1.0f;
+    return result;
+}
+
+// Boolean/flag to float: 0 → 0.0, non-zero → 1.0
+static inline float normalize_flag(uint8_t value)
+{
+    return value ? 1.0f : 0.0f;
+}
 
 //--------------------------------------------------------------------------
 // MQTT Feature Event Handler
@@ -53,11 +113,9 @@ public:
 private:
     const MqttML& inspector;
     
-    // Build feature vector from event (returns array of normalized features)
-    void build_feature_vector(const MqttFeatureEvent& fe, float* features, size_t max_features);
-    
-    // ML inference stub - returns anomaly score (0.0 = normal, 1.0 = anomaly)
-    float run_inference(const float* features, size_t num_features);
+    // Build feature vector from event (fills array with normalized features)
+    // Returns actual number of features written
+    size_t build_feature_vector(const MqttFeatureEvent& fe, float* features, size_t max_features);
 };
 
 void MqttFeatureHandler::handle(DataEvent& de, Flow*)
@@ -87,130 +145,277 @@ void MqttFeatureHandler::handle(DataEvent& de, Flow*)
     if (!conf.enabled)
         return;
     
-    // Build feature vector from the event
-    constexpr size_t NUM_FEATURES = 30;
-    float features[NUM_FEATURES] = {0};
-    build_feature_vector(fe, features, NUM_FEATURES);
+    if (!inspector.is_model_loaded())
+        return;
     
-    // Run ML inference
-    float anomaly_score = run_inference(features, NUM_FEATURES);
+    // Build normalized feature vector
+    float features[MQTT_ML_NUM_FEATURES];
+    size_t num_features = build_feature_vector(fe, features, MQTT_ML_NUM_FEATURES);
     
-    // Check against threshold and alert if anomaly detected
-    if (anomaly_score > conf.anomaly_threshold)
+    // Run autoencoder: feed input, get reconstructed output
+    float output[MQTT_ML_NUM_FEATURES];
+    float rc = inspector.run_model(features, output, num_features);
+    
+    if (rc < 0.0f)
+        return;  // Model error
+    
+    // Compute Mean Squared Error between input and reconstruction
+    float mse = 0.0f;
+    for (size_t i = 0; i < num_features; i++)
+    {
+        float diff = features[i] - output[i];
+        mse += diff * diff;
+    }
+    mse /= static_cast<float>(num_features);
+    
+    // Compare MSE (reconstruction error) against threshold
+    // High MSE = anomaly (model can't reconstruct what it hasn't seen)
+    if (mse >= inspector.get_threshold())
     {
         mqtt_ml_stats.anomalies_detected++;
         DetectionEngine::queue_event(MQTT_ML_GID, MQTT_ML_SID);
     }
 }
 
-void MqttFeatureHandler::build_feature_vector(const MqttFeatureEvent& fe, 
-                                               float* features, 
-                                               size_t max_features)
+size_t MqttFeatureHandler::build_feature_vector(const MqttFeatureEvent& fe, 
+                                                 float* features, 
+                                                 size_t max_features)
 {
-    if (max_features < 30)
-        return;
+    // Ensure we don't overflow the buffer
+    if (max_features < MQTT_ML_NUM_FEATURES)
+        return 0;
     
-    size_t i = 0;
+    size_t idx = 0;
     
-    // Fixed header features (indices 0-4)
-    features[i++] = static_cast<float>(fe.msg_type) / 14.0f;        // Normalized to 0-1
-    features[i++] = static_cast<float>(fe.dup_flag);                 // Already 0 or 1
-    features[i++] = static_cast<float>(fe.qos) / 2.0f;              // Normalized to 0-1
-    features[i++] = static_cast<float>(fe.retain);                   // Already 0 or 1
-    features[i++] = std::min(static_cast<float>(fe.remaining_len) / 65535.0f, 1.0f);
+    // ========== Fixed Header Fields ==========
     
-    // CONNECT features (indices 5-14)
-    features[i++] = static_cast<float>(fe.protocol_version) / 5.0f; // MQTT versions 3-5
-    features[i++] = static_cast<float>(fe.conflag_clean_session);
-    features[i++] = static_cast<float>(fe.conflag_will_flag);
-    features[i++] = static_cast<float>(fe.conflag_will_qos) / 2.0f;
-    features[i++] = static_cast<float>(fe.conflag_will_retain);
-    features[i++] = static_cast<float>(fe.conflag_passwd);
-    features[i++] = static_cast<float>(fe.conflag_uname);
-    features[i++] = std::min(static_cast<float>(fe.keep_alive) / 3600.0f, 1.0f);
-    features[i++] = std::min(static_cast<float>(fe.client_id_len) / 256.0f, 1.0f);
-    features[i++] = std::min(static_cast<float>(fe.username_len) / 256.0f, 1.0f);
+    // Feature 0: msg_type (bounded 1-14) → min-max
+    features[idx++] = normalize_minmax(static_cast<float>(fe.msg_type), 1.0f, 14.0f);
     
-    // More CONNECT features (indices 15-17)
-    features[i++] = std::min(static_cast<float>(fe.passwd_len) / 256.0f, 1.0f);
-    features[i++] = std::min(static_cast<float>(fe.will_topic_len) / 256.0f, 1.0f);
-    features[i++] = std::min(static_cast<float>(fe.will_msg_len) / 1024.0f, 1.0f);
+    // Feature 1: dup_flag (boolean) → one-hot
+    features[idx++] = normalize_flag(fe.dup_flag);
     
-    // CONNACK features (indices 18-19)
-    features[i++] = static_cast<float>(fe.conack_return_code) / 5.0f;
-    features[i++] = static_cast<float>(fe.conack_session_present);
+    // Feature 2: qos (bounded 0-2) → min-max
+    features[idx++] = normalize_minmax(static_cast<float>(fe.qos), 0.0f, 2.0f);
     
-    // PUBLISH features (indices 20-22)
-    features[i++] = std::min(static_cast<float>(fe.topic_len) / 256.0f, 1.0f);
-    features[i++] = std::min(static_cast<float>(fe.payload_len) / 65535.0f, 1.0f);
-    features[i++] = std::min(static_cast<float>(fe.msg_id) / 65535.0f, 1.0f);
+    // Feature 3: retain (boolean) → one-hot
+    features[idx++] = normalize_flag(fe.retain);
     
-    // Timing features (indices 23-24)
-    // Normalize time to seconds, cap at 1 hour
-    features[i++] = std::min(static_cast<float>(fe.time_delta_us) / 3600000000.0f, 1.0f);
-    features[i++] = std::min(static_cast<float>(fe.time_relative_us) / 3600000000.0f, 1.0f);
+    // Feature 4: remaining_len (unbounded) → log normalization
+    features[idx++] = normalize_log(static_cast<float>(fe.remaining_len), MAX_REMAINING_LEN);
     
-    // Brute force features (indices 25-26)
-    features[i++] = std::min(fe.failed_auth_per_second / 100.0f, 1.0f);
-    features[i++] = std::min(static_cast<float>(fe.failed_auth_count) / 100.0f, 1.0f);
+    // ========== CONNECT Fields ==========
     
-    // Flow statistics (index 27)
-    features[i++] = std::min(static_cast<float>(fe.pkt_count) / 10000.0f, 1.0f);
+    // Feature 5: protocol_version (bounded 3-5) → min-max
+    // Note: version 3=MQTT 3.1, 4=MQTT 3.1.1, 5=MQTT 5.0
+    features[idx++] = normalize_minmax(static_cast<float>(fe.protocol_version), 3.0f, 5.0f);
     
-    // Reserved for future features (indices 28-29)
-    features[i++] = 0.0f;
-    features[i++] = 0.0f;
-}
-
-float MqttFeatureHandler::run_inference(const float* features, size_t num_features)
-{
-    // STUB: Placeholder ML inference
-    // This will be replaced with actual ML model inference
-    // For now, implement simple heuristic-based detection
+    // Feature 6-11: Connection flags (booleans) → one-hot
+    features[idx++] = normalize_flag(fe.conflag_clean_session);  // Feature 6
+    features[idx++] = normalize_flag(fe.conflag_will_flag);      // Feature 7
+    features[idx++] = normalize_minmax(static_cast<float>(fe.conflag_will_qos), 0.0f, 2.0f);  // Feature 8
+    features[idx++] = normalize_flag(fe.conflag_will_retain);    // Feature 9
+    features[idx++] = normalize_flag(fe.conflag_passwd);         // Feature 10
+    features[idx++] = normalize_flag(fe.conflag_uname);          // Feature 11
     
-    (void)num_features;  // Unused for now
+    // Feature 12: keep_alive (unbounded but typically 0-65535) → log normalization
+    features[idx++] = normalize_log(static_cast<float>(fe.keep_alive), MAX_KEEP_ALIVE);
     
-    float anomaly_score = 0.0f;
+    // Feature 13-17: String lengths (unbounded) → log normalization
+    features[idx++] = normalize_log(static_cast<float>(fe.client_id_len), MAX_STRING_LEN);   // Feature 13
+    features[idx++] = normalize_log(static_cast<float>(fe.username_len), MAX_STRING_LEN);   // Feature 14
+    features[idx++] = normalize_log(static_cast<float>(fe.passwd_len), MAX_STRING_LEN);     // Feature 15
+    features[idx++] = normalize_log(static_cast<float>(fe.will_topic_len), MAX_STRING_LEN); // Feature 16
+    features[idx++] = normalize_log(static_cast<float>(fe.will_msg_len), MAX_STRING_LEN);   // Feature 17
     
-    // Heuristic 1: High failed auth rate indicates brute force attack
-    // features[25] = failed_auth_per_second (normalized)
-    if (features[25] > 0.1f)  // More than 10 failures/second
-        anomaly_score = std::max(anomaly_score, features[25]);
+    // ========== CONNACK Fields ==========
     
-    // Heuristic 2: Unusual protocol version
-    // features[5] = protocol_version (normalized, expecting 0.6-1.0 for versions 3-5)
-    if (features[5] > 0.0f && features[5] < 0.5f)  // Version < 3
-        anomaly_score = std::max(anomaly_score, 0.8f);
+    // Feature 18: conack_return_code (bounded 0-5 for MQTT 3.1.1) → min-max
+    features[idx++] = normalize_minmax(static_cast<float>(fe.conack_return_code), 0.0f, 5.0f);
     
-    // Heuristic 3: Very large payloads might indicate DoS
-    // features[21] = payload_len (normalized)
-    if (features[21] > 0.9f)  // Very large payload
-        anomaly_score = std::max(anomaly_score, 0.3f);
+    // Feature 19: conack_session_present (boolean) → one-hot
+    features[idx++] = normalize_flag(fe.conack_session_present);
     
-    // Heuristic 4: Many failed auth attempts
-    // features[26] = failed_auth_count (normalized)
-    if (features[26] > 0.5f)  // More than 50 failures
-        anomaly_score = std::max(anomaly_score, 0.7f);
+    // ========== PUBLISH Fields ==========
     
-    return anomaly_score;
+    // Feature 20: topic_len (unbounded) → log normalization
+    features[idx++] = normalize_log(static_cast<float>(fe.topic_len), MAX_STRING_LEN);
+    
+    // Feature 21: payload_len (unbounded) → log normalization
+    features[idx++] = normalize_log(static_cast<float>(fe.payload_len), MAX_PAYLOAD_LEN);
+    
+    // Feature 22: msg_id (bounded 0-65535) → log normalization
+    features[idx++] = normalize_log(static_cast<float>(fe.msg_id), 65535.0f);
+    
+    // ========== Timing Features ==========
+    
+    // Feature 23: time_delta_us (unbounded) → log normalization
+    // This is time since first packet in flow (microseconds)
+    features[idx++] = normalize_log(static_cast<float>(fe.time_delta_us), MAX_TIME_DELTA_US);
+    
+    // Feature 24: time_relative_us (same as delta, included for compatibility)
+    features[idx++] = normalize_log(static_cast<float>(fe.time_relative_us), MAX_TIME_DELTA_US);
+    
+    // ========== Brute Force Detection Features ==========
+    
+    // Feature 25: failed_auth_per_second (unbounded) → log normalization
+    features[idx++] = normalize_log(fe.failed_auth_per_second, MAX_FAILED_AUTH_RATE);
+    
+    // Feature 26: failed_auth_count (unbounded) → log normalization
+    features[idx++] = normalize_log(static_cast<float>(fe.failed_auth_count), 100.0f);
+    
+    // ========== Flow Statistics ==========
+    
+    // Feature 27: pkt_count (unbounded) → log normalization
+    features[idx++] = normalize_log(static_cast<float>(fe.pkt_count), MAX_PKT_COUNT);
+    
+    // Verify we wrote exactly the expected number of features
+    assert(idx == MQTT_ML_NUM_FEATURES);
+    
+    return idx;
 }
 
 //--------------------------------------------------------------------------
-// MqttML inspector methods
+// MqttML inspector methods — TF Lite model lifecycle
 //--------------------------------------------------------------------------
+
+MqttML::~MqttML()
+{
+#ifdef HAVE_TFLITE
+    if (interpreter)
+        TfLiteInterpreterDelete(interpreter);
+    if (options)
+        TfLiteInterpreterOptionsDelete(options);
+    if (model)
+        TfLiteModelDelete(model);
+#endif
+}
+
+bool MqttML::load_model()
+{
+#ifdef HAVE_TFLITE
+    if (conf.model_path.empty())
+    {
+        LogMessage("mqtt_ml: no model_path configured, ML detection disabled\n");
+        return false;
+    }
+
+    model = TfLiteModelCreateFromFile(conf.model_path.c_str());
+    if (!model)
+    {
+        WarningMessage("mqtt_ml: failed to load model from '%s'\n", conf.model_path.c_str());
+        return false;
+    }
+
+    options = TfLiteInterpreterOptionsCreate();
+    TfLiteInterpreterOptionsSetNumThreads(options, 1);
+
+    interpreter = TfLiteInterpreterCreate(model, options);
+    if (!interpreter)
+    {
+        WarningMessage("mqtt_ml: failed to create TF Lite interpreter\n");
+        return false;
+    }
+
+    if (TfLiteInterpreterAllocateTensors(interpreter) != kTfLiteOk)
+    {
+        WarningMessage("mqtt_ml: failed to allocate tensors\n");
+        return false;
+    }
+
+    LogMessage("mqtt_ml: model loaded from '%s'\n", conf.model_path.c_str());
+    return true;
+#else
+    WarningMessage("mqtt_ml: Snort was compiled without TF Lite support (HAVE_TFLITE)\n");
+    return false;
+#endif
+}
+
+bool MqttML::load_threshold()
+{
+    if (!conf.threshold_path.empty())
+    {
+        std::ifstream f(conf.threshold_path);
+        if (f.is_open())
+        {
+            double val;
+            if (f >> val)
+            {
+                threshold = static_cast<float>(val);
+                LogMessage("mqtt_ml: threshold loaded from '%s': %e\n",
+                    conf.threshold_path.c_str(), threshold);
+                return true;
+            }
+        }
+        WarningMessage("mqtt_ml: failed to read threshold from '%s', using configured value\n",
+            conf.threshold_path.c_str());
+    }
+
+    // Fall back to configured anomaly_threshold
+    threshold = static_cast<float>(conf.anomaly_threshold);
+    return true;
+}
+
+float MqttML::run_model(const float* input, float* output, size_t num_features) const
+{
+#ifdef HAVE_TFLITE
+    if (!interpreter)
+        return -1.0f;
+
+    // Copy input features to input tensor
+    TfLiteTensor* input_tensor = TfLiteInterpreterGetInputTensor(interpreter, 0);
+    if (!input_tensor)
+        return -1.0f;
+
+    TfLiteTensorCopyFromBuffer(input_tensor, input, num_features * sizeof(float));
+
+    // Run inference
+    if (TfLiteInterpreterInvoke(interpreter) != kTfLiteOk)
+        return -1.0f;
+
+    // Copy output (reconstructed features) from output tensor
+    const TfLiteTensor* output_tensor = TfLiteInterpreterGetOutputTensor(interpreter, 0);
+    if (!output_tensor)
+        return -1.0f;
+
+    TfLiteTensorCopyToBuffer(output_tensor, output, num_features * sizeof(float));
+    return 0.0f;  // Success
+#else
+    (void)input;
+    (void)output;
+    (void)num_features;
+    return -1.0f;
+#endif
+}
 
 void MqttML::show(const SnortConfig*) const
 {
     ConfigLogger::log_value("anomaly_threshold", conf.anomaly_threshold);
     ConfigLogger::log_flag("enabled", conf.enabled);
+    if (!conf.model_path.empty())
+        ConfigLogger::log_value("model_path", conf.model_path.c_str());
+    if (!conf.threshold_path.empty())
+        ConfigLogger::log_value("threshold_path", conf.threshold_path.c_str());
 }
 
 bool MqttML::configure(SnortConfig*)
 {
+    // Load TF Lite model
+    if (conf.enabled)
+    {
+        model_loaded = load_model();
+        load_threshold();
+
+        if (model_loaded)
+            LogMessage("mqtt_ml: ML anomaly detection active (threshold=%e)\n", threshold);
+        else
+            LogMessage("mqtt_ml: ML model not loaded, events will be counted but not scored\n");
+    }
+
     // Subscribe to MQTT feature events
     DataBus::subscribe(mqtt_pub_key, MqttEventIds::MQTT_FEATURE,
         new MqttFeatureHandler(*this));
-    
+
     return true;
 }
 

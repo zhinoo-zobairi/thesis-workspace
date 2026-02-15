@@ -32,8 +32,7 @@ struct MqttEventIds
 {
     enum : unsigned
     {
-        MQTT_PUBLISH,   // A PUBLISH packet was received
-        MQTT_CONNECT,   // A CONNECT packet was received
+        MQTT_FEATURE,   // Comprehensive feature event for ML (published for every packet)
         MAX
     };
 };
@@ -41,46 +40,52 @@ struct MqttEventIds
 // PubKey for registering MQTT as a publisher
 const snort::PubKey mqtt_pub_key { "mqtt", MqttEventIds::MAX };
 
-// Event published when an MQTT PUBLISH packet is received
-class MqttPublishEvent : public snort::DataEvent
+// MqttFeatureEvent is a COMPREHENSIVE event that contains ALL features extracted from ANY MQTT packet type
+class MqttFeatureEvent : public snort::DataEvent // All fields default to 0
 {
 public:
-    MqttPublishEvent(const uint8_t* topic_data, uint16_t topic_len,
-                     const uint8_t* payload_data, uint16_t payload_len,
-                     uint8_t qos_level)
-        : topic(topic_data), topic_length(topic_len),
-          payload(payload_data), payload_length(payload_len),
-          qos(qos_level) { }
-
-    const uint8_t* get_topic() const { return topic; }
-    uint16_t get_topic_length() const { return topic_length; }
-
-    const uint8_t* get_payload() const { return payload; }
-    uint16_t get_payload_length() const { return payload_length; }
-
-    uint8_t get_qos() const { return qos; }
-
-private:
-    const uint8_t* topic;
-    uint16_t topic_length;
-    const uint8_t* payload;
-    uint16_t payload_length;
-    uint8_t qos;
-};
-
-// Event published when an MQTT CONNECT packet is received
-class MqttConnectEvent : public snort::DataEvent
-{
-public:
-    MqttConnectEvent(const uint8_t* client_id_data, uint16_t client_id_len)
-        : client_id(client_id_data), client_id_length(client_id_len) { }
-
-    const uint8_t* get_client_id() const { return client_id; }
-    uint16_t get_client_id_length() const { return client_id_length; }
-
-private:
-    const uint8_t* client_id;
-    uint16_t client_id_length;
+    // Fixed header fields
+    uint8_t msg_type = 0;           // MQTT packet type (1-14)
+    uint8_t dup_flag = 0;           // Duplicate delivery flag
+    uint8_t qos = 0;                // Quality of Service (0-2)
+    uint8_t retain = 0;             // Retain flag
+    uint32_t remaining_len = 0;     // Remaining length from fixed header
+    
+    // CONNECT fields
+    uint8_t protocol_version = 0;   // MQTT version (3, 4, or 5)
+    uint8_t connect_flags = 0;      // Raw connect flags byte
+    uint8_t conflag_clean_session = 0;
+    uint8_t conflag_will_flag = 0;
+    uint8_t conflag_will_qos = 0;
+    uint8_t conflag_will_retain = 0;
+    uint8_t conflag_passwd = 0;
+    uint8_t conflag_uname = 0;
+    uint16_t keep_alive = 0;
+    uint16_t client_id_len = 0;
+    uint16_t username_len = 0;
+    uint16_t passwd_len = 0;
+    uint16_t will_topic_len = 0;
+    uint16_t will_msg_len = 0;
+    
+    // CONNACK fields
+    uint8_t conack_return_code = 0;
+    uint8_t conack_session_present = 0;
+    
+    // PUBLISH fields
+    uint16_t topic_len = 0;
+    uint16_t payload_len = 0;
+    uint16_t msg_id = 0;            // Packet identifier (for QoS > 0)
+    
+    // Timing features (microseconds)
+    int64_t time_delta_us = 0;      // Time since first packet in flow
+    int64_t time_relative_us = 0;   // Same as delta (for compatibility)
+    
+    // Brute force detection
+    float failed_auth_per_second = 0.0f;
+    uint32_t failed_auth_count = 0;
+    
+    // Flow statistics
+    uint32_t pkt_count = 0;         // Packet count in this flow
 };
 
 } // namespace snort
